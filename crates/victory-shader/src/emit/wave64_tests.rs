@@ -107,8 +107,14 @@ fn s_cbranch_execz(delta_words: i16) -> u32 {
 fn v_mov_b32(dst: u32, src0: u32) -> u32 {
     vop1(dst, 0x01, src0)
 }
+fn v_cvt_f32_u32(dst: u32, src0: u32) -> u32 {
+    vop1(dst, 0x06, src0)
+}
 fn v_readfirstlane_b32(sdst: u32, vsrc: u32) -> u32 {
     vop1(sdst, 0x02, vgpr(vsrc))
+}
+fn v_add_f32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
+    vop2(0x03, dst, src0, vsrc1)
 }
 fn v_lshlrev_b32(dst: u32, shift: u32, vsrc1: u32) -> u32 {
     vop2(0x1A, dst, shift, vsrc1)
@@ -124,6 +130,9 @@ fn v_add_nc_u32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
 }
 fn v_sub_nc_u32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
     vop2(0x26, dst, src0, vsrc1)
+}
+fn v_subrev_nc_u32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
+    vop2(0x27, dst, src0, vsrc1)
 }
 fn v_cmp_lt_u32(src0: u32, vsrc1: u32) -> u32 {
     vopc(0xC1, src0, vsrc1)
@@ -149,6 +158,9 @@ fn v_mbcnt_lo_u32_b32(dst: u32, mask: u32, b: u32) -> [u32; 2] {
 fn v_mbcnt_hi_u32_b32(dst: u32, mask: u32, b: u32) -> [u32; 2] {
     vop3(0x366, dst, mask, b, 0)
 }
+fn v_permlanex16_b32(dst: u32, vsrc0: u32, src1: u32, src2: u32) -> [u32; 2] {
+    vop3(0x378, dst, vgpr(vsrc0), src1, src2)
+}
 
 fn s_load_dwordx4(sdst: u32, sbase: u32) -> [u32; 2] {
     [0xF408_0000 | (sdst << 6) | (sbase >> 1), NULL_OP << 25]
@@ -157,6 +169,13 @@ fn s_load_dwordx4(sdst: u32, sbase: u32) -> [u32; 2] {
 fn buffer_store_dword(vdata: u32, vaddr: u32, srsrc: u32) -> [u32; 2] {
     [
         0xE070_1000, // buffer_store_dword, offen=1
+        vaddr | (vdata << 8) | ((srsrc >> 2) << 16) | (inline_u(0) << 24),
+    ]
+}
+
+fn buffer_store_dwordx4(vdata: u32, vaddr: u32, srsrc: u32) -> [u32; 2] {
+    [
+        0xE078_1000, // buffer_store_dwordx4, offen=1
         vaddr | (vdata << 8) | ((srsrc >> 2) << 16) | (inline_u(0) << 24),
     ]
 }
@@ -206,6 +225,29 @@ fn make_cs_program(
     }
 }
 
+fn lower_cs(
+    native: &NativeProgram,
+    mode: Wave64Mode,
+) -> Result<super::lower::Lowered, ShaderError> {
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io_res = io::raise(&p, native)?;
+    let st = st?;
+    super::lower::lower(&super::lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io_res,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        options: TranslateOptions { wave64: mode },
+    })
+}
+
 fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, ShaderError> {
     let dxbc = empty_dxbc();
     let container = Container::parse(&dxbc)?;
@@ -223,6 +265,109 @@ fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, Shade
         &res,
         TranslateOptions { wave64: mode },
     )
+}
+
+#[derive(Clone, Copy)]
+enum Lane0Guard {
+    TidEqZeroBranch,
+    ReadFirstLaneBranch,
+    MbcntEqZeroBranch,
+    TidEqZeroInline,
+}
+
+/// 64-thread (or custom thread-count) synthetic GFX10 float whole-wave reduction (`v_add_f32`)
+/// + virtual lane-0 16B UAV write (`buffer_store_dwordx4` `[sum, 1.0, 2.0, 3.0]`).
+///
+/// When `half1_nonzero` is false: lanes `0..31 = float(tid + 1)`, lanes `32..63 = 0.0`.
+/// When `half1_nonzero` is true: lanes `0..31 = 0.0`, lanes `32..63 = float(tid - 31)`.
+/// Both sum to `528.0f32` (`1 + 2 + ... + 32`).
+fn whole_wave_float_sum_uav_x4_program(
+    threads: [u32; 3],
+    lds_bytes: u32,
+    half1_nonzero: bool,
+    guard: Lane0Guard,
+) -> NativeProgram {
+    let mut code = Vec::new();
+    if half1_nonzero {
+        code.push(v_cmp_lt_u32(inline_u(31), 0)); // vcc = (31 < v0) i.e. tid >= 32
+        code.push(v_subrev_nc_u32(3, inline_u(31), 0)); // v3 = tid - 31
+    } else {
+        code.push(v_cmp_gt_u32(inline_u(32), 0)); // vcc = (32 > v0) i.e. tid < 32
+        code.push(v_add_nc_u32(3, inline_u(1), 0)); // v3 = tid + 1
+    }
+    code.push(v_cvt_f32_u32(3, vgpr(3)));
+    code.extend_from_slice(&v_cndmask_b32(2, inline_u(0), vgpr(3), VCC));
+
+    // Whole-wave float reduction section (`v2` -> `v10`):
+    // 1. intra-row prefix sum via DPP row_shr:{1,2,4,8}
+    // 2. cross-row merge within each 32-lane half via `v_permlanex16_b32` + `v_add_f32`
+    // 3. cross-half merge via `v_readlane_b32` at lanes 15 and 63 + `v_add_f32`
+    code.push(s_or_saveexec_b64(4, NEG_ONE));
+    code.extend_from_slice(&v_cndmask_b32(10, inline_u(0), vgpr(2), 4));
+    for shift in [0x111u32, 0x112, 0x114, 0x118] {
+        code.extend_from_slice(&dpp_row_shr(0x03, 10, 10, 10, shift, 0xF));
+    }
+    code.extend_from_slice(&v_permlanex16_b32(11, 10, NEG_ONE, NEG_ONE));
+    code.push(v_add_f32(10, vgpr(10), 11));
+    code.extend_from_slice(&v_readlane_b32(12, 10, inline_u(15)));
+    code.extend_from_slice(&v_readlane_b32(13, 10, inline_u(63)));
+    code.push(v_mov_b32(10, 12));
+    code.push(v_add_f32(10, 13, 10));
+    code.push(s_mov_b64(EXEC_LO, 4));
+
+    // Load UAV 0 descriptor (`s[8:11]`) and prepare 16-byte payload `[sum, 1.0, 2.0, 3.0]`.
+    code.push(s_mov_b32(1, inline_u(0)));
+    code.extend_from_slice(&s_load_dwordx4(8, 0));
+    code.push(v_mov_b32(16, vgpr(10)));
+    for (reg, f) in [(17u32, 1.0f32), (18, 2.0), (19, 3.0)] {
+        code.push(v_mov_b32(reg, LIT));
+        code.push(f.to_bits());
+    }
+    code.push(v_mov_b32(15, inline_u(0)));
+
+    match guard {
+        Lane0Guard::TidEqZeroBranch => {
+            code.push(v_cmp_eq_u32(inline_u(0), 0));
+            code.push(s_and_saveexec_b64(6, VCC));
+            let br_idx = code.len();
+            code.push(0);
+            code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+            let after = code.len();
+            code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+            code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        }
+        Lane0Guard::ReadFirstLaneBranch => {
+            code.push(v_readfirstlane_b32(14, 0));
+            code.push(v_cmp_eq_u32(14, 0));
+            code.push(s_and_saveexec_b64(6, VCC));
+            let br_idx = code.len();
+            code.push(0);
+            code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+            let after = code.len();
+            code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+            code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        }
+        Lane0Guard::MbcntEqZeroBranch => {
+            code.extend_from_slice(&v_mbcnt_lo_u32_b32(14, NEG_ONE, inline_u(0)));
+            code.extend_from_slice(&v_mbcnt_hi_u32_b32(14, NEG_ONE, vgpr(14)));
+            code.push(v_cmp_eq_u32(inline_u(0), 14));
+            code.push(s_and_saveexec_b64(6, VCC));
+            let br_idx = code.len();
+            code.push(0);
+            code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+            let after = code.len();
+            code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+            code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        }
+        Lane0Guard::TidEqZeroInline => {
+            code.push(v_cmp_eq_u32(inline_u(0), 0));
+            code.push(s_and_saveexec_b64(6, VCC));
+            code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+            code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        }
+    }
+    code.push(S_ENDPGM);
+    make_cs_program(&code, threads, lds_bytes, false)
 }
 
 fn psv_wave_range(shader: &HostShader) -> (u32, u32) {
@@ -762,6 +907,55 @@ fn translate_with_handles_synthetic_wave64_container() {
     assert_eq!(psv_wave_range(&sh_emu), (0, u32::MAX));
 }
 
+#[test]
+fn pure_wave_sections_lds_allocation_and_emulate_contract() {
+    // Pure wave::sections shader: DPP + v_permlanex16_b32 + v_readlane_b32 all lie inside the
+    // recognized section, so Wave64Mode::Wave32 must allocate only 2 * virtual_waves LDS dwords
+    // (NOT 66 * virtual_waves), while Wave64Mode::Emulate keeps zero WAVE_OPS and PSV (0, u32::MAX).
+    let p64 =
+        whole_wave_float_sum_uav_x4_program([64, 1, 1], 0, false, Lane0Guard::TidEqZeroBranch);
+    let w32_64 = lower_cs(&p64, Wave64Mode::Wave32).unwrap();
+    assert_eq!(w32_64.lds_dwords, 2);
+    assert!(w32_64.wave_ops);
+
+    let p64_title_lds =
+        whole_wave_float_sum_uav_x4_program([64, 1, 1], 512, false, Lane0Guard::TidEqZeroBranch);
+    let w32_64_title = lower_cs(&p64_title_lds, Wave64Mode::Wave32).unwrap();
+    assert_eq!(w32_64_title.lds_dwords, 128 + 2);
+
+    let p128 =
+        whole_wave_float_sum_uav_x4_program([128, 1, 1], 0, false, Lane0Guard::TidEqZeroBranch);
+    let w32_128 = lower_cs(&p128, Wave64Mode::Wave32).unwrap();
+    assert_eq!(w32_128.lds_dwords, 4);
+
+    // 1024 threads (16 virtual waves) + 32256 bytes (63 * 512B granules = 8064 dwords) title LDS:
+    // 8064 + 2*16 = 8096 <= 8192 succeeds in Wave32 (would overflow if 64*16 were wasted).
+    let p1024_near_limit = whole_wave_float_sum_uav_x4_program(
+        [1024, 1, 1],
+        32256,
+        false,
+        Lane0Guard::TidEqZeroBranch,
+    );
+    let w32_1024 = lower_cs(&p1024_near_limit, Wave64Mode::Wave32).unwrap();
+    assert_eq!(w32_1024.lds_dwords, 8064 + 32);
+
+    let emu_64 = lower_cs(&p64, Wave64Mode::Emulate).unwrap();
+    assert!(!emu_64.wave_ops);
+    assert_eq!(emu_64.lds_dwords, 66);
+    let emu_shader = emit_cs(&p64, Wave64Mode::Emulate).unwrap();
+    assert_eq!(psv_wave_range(&emu_shader), (0, u32::MAX));
+    assert_eq!(sfi0_flags(&emu_shader) & 0x4000, 0);
+
+    // An unresolved dynamic v_readlane_b32 outside wave::sections must still allocate 64 * vwaves.
+    let mut external_readlane = vec![v_mov_b32(1, 0)];
+    external_readlane.extend_from_slice(&v_readlane_b32(4, 1, vgpr(0)));
+    external_readlane.push(v_mov_b32(1, 4));
+    emit_uav_store(&mut external_readlane, 1, 0);
+    external_readlane.push(S_ENDPGM);
+    let p_ext = make_cs_program(&external_readlane, [64, 1, 1], 0, false);
+    assert_eq!(lower_cs(&p_ext, Wave64Mode::Wave32).unwrap().lds_dwords, 66);
+}
+
 #[cfg(windows)]
 mod gpu {
     use std::sync::{Mutex, OnceLock};
@@ -769,44 +963,49 @@ mod gpu {
     use super::*;
     use crate::emit::host::{Dispatch, Host, View};
 
-    fn with_hosts(f: impl FnOnce(&[Option<Host>; 2])) {
-        static HOSTS: OnceLock<Mutex<[Option<Host>; 2]>> = OnceLock::new();
+    fn with_hosts(f: impl FnOnce(&[(String, Host)])) {
+        static HOSTS: OnceLock<Mutex<Vec<(String, Host)>>> = OnceLock::new();
         let _one = super::super::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let lock = HOSTS.get_or_init(|| Mutex::new([Host::new(false).ok(), Host::new(true).ok()]));
+        let lock = HOSTS.get_or_init(|| Mutex::new(Host::all_adapters()));
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         f(&guard);
     }
 
-    fn run_on_hosts(
+    fn run_on_hosts_modes(
         name: &str,
         prog: &NativeProgram,
         groups: [u32; 3],
         uav_dwords: u32,
         expected: &[u32],
         expect_native_fail: bool,
+        run_native_when_supported: bool,
     ) {
         with_hosts(|hosts| {
-            for (warp_idx, host) in hosts.iter().enumerate() {
-                let Some(host) = host else {
-                    continue;
-                };
-                let warp = warp_idx == 1;
+            assert!(!hosts.is_empty(), "expected at least one SM 6.6 adapter");
+            for (adapter_name, host) in hosts {
                 let mut modes = vec![Wave64Mode::Emulate];
                 if host.supports_wave32() {
                     modes.push(Wave64Mode::Wave32);
+                }
+                if run_native_when_supported && host.supports_wave64() {
+                    modes.push(Wave64Mode::Native);
                 }
                 if expect_native_fail && !host.supports_wave64() {
                     let native = emit_cs(prog, Wave64Mode::Native).unwrap();
                     assert!(
                         host.compute_pipeline(&native).is_err(),
-                        "{name}: Native Wave64 unexpectedly built a PSO on warp={warp}"
+                        "{name}: Native Wave64 unexpectedly built a PSO on {adapter_name}"
                     );
                 }
+                let (ops, min_lane, max_lane) = host.wave_lanes();
+                eprintln!(
+                    "[wave64_tests] {name}: adapter={adapter_name:?} wave=({ops}, {min_lane}..={max_lane}) modes={modes:?}"
+                );
                 for mode in modes {
                     let shader = emit_cs(prog, mode)
-                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}): {e}"));
+                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, {adapter_name}): {e}"));
                     if let Ok(mut v) = super::super::validator::Validator::load(
                         super::super::validator::Validator::default_path().as_deref(),
                     ) {
@@ -815,7 +1014,7 @@ mod gpu {
                     }
                     let (root, pso) = host
                         .compute_pipeline(&shader)
-                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}) PSO: {e}"));
+                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, {adapter_name}) PSO: {e}"));
                     let out = host
                         .dispatch(
                             &root,
@@ -827,15 +1026,36 @@ mod gpu {
                                 groups,
                             },
                         )
-                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}) dispatch: {e}"));
+                        .unwrap_or_else(|e| {
+                            panic!("{name} ({mode:?}, {adapter_name}) dispatch: {e}")
+                        });
                     assert_eq!(
                         &out[0][..expected.len()],
                         expected,
-                        "{name} ({mode:?}, warp={warp}) output mismatch"
+                        "{name} ({mode:?}, {adapter_name}) output mismatch"
                     );
                 }
             }
         });
+    }
+
+    fn run_on_hosts(
+        name: &str,
+        prog: &NativeProgram,
+        groups: [u32; 3],
+        uav_dwords: u32,
+        expected: &[u32],
+        expect_native_fail: bool,
+    ) {
+        run_on_hosts_modes(
+            name,
+            prog,
+            groups,
+            uav_dwords,
+            expected,
+            expect_native_fail,
+            false,
+        );
     }
 
     #[test]
@@ -1284,5 +1504,51 @@ mod gpu {
             &expected,
             false,
         );
+    }
+
+    #[test]
+    fn gpu_64_threads_float_whole_wave_sum_lane0_uav_x4() {
+        let expected = [
+            528.0f32.to_bits(),
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+        ];
+        for (label, half1_nonzero, guard) in [
+            ("h0_tid_eq_0_branch", false, Lane0Guard::TidEqZeroBranch),
+            ("h1_tid_eq_0_branch", true, Lane0Guard::TidEqZeroBranch),
+            ("h0_tid_eq_0_inline", false, Lane0Guard::TidEqZeroInline),
+            ("h1_tid_eq_0_inline", true, Lane0Guard::TidEqZeroInline),
+        ] {
+            let prog = whole_wave_float_sum_uav_x4_program([64, 1, 1], 0, half1_nonzero, guard);
+            run_on_hosts_modes(label, &prog, [1, 1, 1], 4, &expected, true, true);
+        }
+    }
+
+    #[test]
+    fn gpu_64_threads_float_whole_wave_sum_readfirstlane_and_mbcnt_lane0_guards() {
+        let expected = [
+            528.0f32.to_bits(),
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+        ];
+        for (label, half1_nonzero, guard) in [
+            (
+                "h0_readfirstlane_guard",
+                false,
+                Lane0Guard::ReadFirstLaneBranch,
+            ),
+            (
+                "h1_readfirstlane_guard",
+                true,
+                Lane0Guard::ReadFirstLaneBranch,
+            ),
+            ("h0_mbcnt_guard", false, Lane0Guard::MbcntEqZeroBranch),
+            ("h1_mbcnt_guard", true, Lane0Guard::MbcntEqZeroBranch),
+        ] {
+            let prog = whole_wave_float_sum_uav_x4_program([64, 1, 1], 0, half1_nonzero, guard);
+            run_on_hosts_modes(label, &prog, [1, 1, 1], 4, &expected, true, true);
+        }
     }
 }
