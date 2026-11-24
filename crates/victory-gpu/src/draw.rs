@@ -272,10 +272,15 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            let desc = record.desc();
+            let Some(rtv) = host.rtv(texture, desc.as_ref()) else {
+                rtvs.push(host.null_rtv(texture, desc.as_ref()));
+                continue;
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(rtv);
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1214,4 +1219,286 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_rt_target_keeps_the_next_color_slot() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::s;
+
+        struct Held(This);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let device = &host.device;
+        let list = host.new_list().expect("host command list");
+        let l = &list.list;
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let source = r#"
+            [RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)")]
+            float4 vs(uint id : SV_VertexID) : SV_Position {
+                return float4(id == 2 ? 3 : -1, id == 1 ? -3 : 1, 0, 1);
+            }
+            struct Colors { float4 red : SV_Target0; float4 green : SV_Target1; };
+            Colors ps() {
+                Colors c;
+                c.red = float4(1, 0, 0, 1);
+                c.green = float4(0, 1, 0, 1);
+                return c;
+            }
+        "#;
+        let compile = |entry, target| {
+            let mut code = None;
+            // SAFETY: live shader source and names, with a local output pointer.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("dropped-rt-slot-test"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+                .expect("compile fixture shader");
+            }
+            code.expect("fixture bytecode")
+        };
+        let vs = compile(s!("vs"), s!("vs_5_1"));
+        let ps = compile(s!("ps"), s!("ps_5_1"));
+        // SAFETY: compiled fixture shaders and the embedded root signature are live.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytecode = |blob: &ID3DBlob| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: blob.GetBufferPointer(),
+                BytecodeLength: blob.GetBufferSize(),
+            };
+            let code = bytecode(&vs);
+            let root = device
+                .CreateRootSignature(
+                    0,
+                    std::slice::from_raw_parts(code.pShaderBytecode.cast(), code.BytecodeLength),
+                )
+                .expect("graphics root signature");
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code,
+                PS: bytecode(&ps),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 2,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[1] = format;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            desc.BlendState.RenderTarget[1].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let pso = device
+                .CreateGraphicsPipelineState(&desc)
+                .expect("graphics pipeline");
+            (root, pso)
+        };
+
+        const SIDE: u32 = 4;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let make = |tex_format: DXGI_FORMAT| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(SIDE),
+                Height: SIDE,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: tex_format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let null = std::ptr::null();
+            let iid = ID3D12Resource::IID;
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                    null.cast(),
+                    (&raw const iid).cast(),
+                    &mut resource,
+                ),
+                crate::object::S_OK
+            );
+            Held(resource)
+        };
+
+        // Slot 0 uses BC1_UNORM, whose ALLOW_RENDER_TARGET flag is dropped on
+        // every D3D12 adapter; slot 1 is a live RGBA8 render target.
+        let dropped = make(DXGI_FORMAT_BC1_UNORM);
+        let live = make(format);
+        let dropped_tex = crate::resource::host_resource(dropped.0).expect("dropped-RT texture");
+        // SAFETY: live host resource.
+        let dropped_flags = unsafe { dropped_tex.GetDesc() }.Flags;
+        assert_eq!(
+            dropped_flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0,
+            0
+        );
+        let color = crate::resource::host_resource(live.0).expect("live color target");
+
+        let null = std::ptr::null();
+        let mut slots = [[0u64; 16]; 2];
+        let handles = slots.each_mut().map(|slot| slot.as_mut_ptr() as u64);
+        crate::descriptor::create_rtv(null, dropped.0, null.cast(), handles[0]);
+        crate::descriptor::create_rtv(null, live.0, null.cast(), handles[1]);
+
+        crate::list::ensure_state(&list, live.0, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        let live_rtv = host.rtv(color, None).expect("live RTV");
+        // SAFETY: open list, live target and graphics pipeline.
+        unsafe {
+            l.ClearRenderTargetView(live_rtv, &[0.0, 0.0, 1.0, 1.0], None);
+            l.SetGraphicsRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
+        viewports(
+            &list,
+            &[D3D12_VIEWPORT {
+                Width: SIDE as f32,
+                Height: SIDE as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }],
+        );
+        scissors(
+            &list,
+            &[RECT {
+                right: SIDE as i32,
+                bottom: SIDE as i32,
+                ..Default::default()
+            }],
+        );
+        let mut state = State::default();
+        state.set_targets(&list, &handles, 0);
+        assert_eq!(state.targets, [live.0 as usize]);
+        // SAFETY: complete graphics state on the open list.
+        unsafe { l.DrawInstanced(3, 1, 0, 0) };
+
+        crate::list::ensure_state(&list, live.0, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut size = 0;
+        let mut readback = None;
+        // SAFETY: live color target and open command list.
+        let readback: ID3D12Resource = unsafe {
+            device.GetCopyableFootprints(
+                &color.GetDesc(),
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut size),
+            );
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: size,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .expect("readback buffer");
+            let readback = readback.expect("readback buffer");
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(color),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            readback
+        };
+
+        list.close();
+        assert_eq!(host.log_messages(), None);
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+
+        let mut mapped = std::ptr::null_mut();
+        let mut pixels = Vec::new();
+        // SAFETY: submission has finished and all offsets stay inside the footprint.
+        unsafe {
+            readback
+                .Map(0, None, Some(&mut mapped))
+                .expect("map readback");
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let at = footprint.Offset as usize
+                        + (y * footprint.Footprint.RowPitch + x * 4) as usize;
+                    pixels.push(mapped.cast::<u8>().add(at).cast::<[u8; 4]>().read());
+                }
+            }
+            readback.Unmap(0, None);
+        }
+        assert_eq!(pixels, [[0, 255, 0, 255]; (SIDE * SIDE) as usize]);
+    }
 }

@@ -747,12 +747,18 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view of `resource`, valid until it is recorded,
+    /// or `None` if the host resource lacks `ALLOW_RENDER_TARGET`.
     pub(crate) fn rtv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        // SAFETY: a live resource.
+        let flags = unsafe { resource.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+            return None;
+        }
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
@@ -760,6 +766,60 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            Some(handle)
+        }
+    }
+
+    /// A typed null render target view that preserves render-target slot
+    /// indices when `resource` cannot be bound as a host render target.
+    pub(crate) fn null_rtv(
+        &self,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let candidate = desc
+            .map(|d| d.Format)
+            .filter(|f| *f != DXGI_FORMAT_UNKNOWN)
+            // SAFETY: a live resource.
+            .unwrap_or_else(|| unsafe { resource.GetDesc() }.Format);
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: candidate,
+            ..Default::default()
+        };
+        // SAFETY: plain feature query into our struct.
+        let supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
+        let null_desc = match desc {
+            Some(d) if supported && d.ViewDimension != D3D12_RTV_DIMENSION_UNKNOWN => *d,
+            _ => D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: if supported {
+                    candidate
+                } else {
+                    DXGI_FORMAT_R8G8B8A8_UNORM
+                },
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV {
+                        MipSlice: 0,
+                        PlaneSlice: 0,
+                    },
+                },
+            },
+        };
+        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a slot of our heap and a typed null view description.
+        unsafe {
+            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.rtv_size) as usize;
+            self.device
+                .CreateRenderTargetView(None, Some(&null_desc), handle);
             handle
         }
     }
