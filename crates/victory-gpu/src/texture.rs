@@ -165,6 +165,26 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    #[cfg(feature = "diagnostics")]
+    if !staging.footprints.is_empty() {
+        // SAFETY: a live host texture.
+        let d = unsafe { texture.GetDesc() };
+        list.record_write(crate::capture::WriteRecord {
+            target: resource as usize,
+            source: None,
+            kind: crate::capture::WriteKind::TextureUpload,
+            slot: None,
+            subresource: 0,
+            width: d.Width,
+            height: d.Height,
+            format: d.Format.0 as u32,
+            pipeline: String::new(),
+            submission: 0,
+            list_index: 0,
+            op_index: 0,
+            frame: 0,
+        });
+    }
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
 }

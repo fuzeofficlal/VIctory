@@ -522,6 +522,8 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            let (id, reason) = crate::pipeline::drop_summary(self.pipeline as This);
+            crate::capture::record_dropped_dispatch(&id, &reason);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -531,19 +533,32 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                let (id, reason) = crate::pipeline::drop_summary(self.pipeline as This);
+                crate::capture::record_dropped_dispatch(&id, &reason);
+            }
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            #[cfg(feature = "diagnostics")]
+            crate::capture::record_dropped_dispatch(&p.name, "dispatch with graphics pipeline");
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::record_dropped_dispatch(&p.name, "compute bind failed");
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        {
+            list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+            let op_index = list.next_op_index();
+            self.record_input_trace(list, p, true, op_index, &[]);
+            self.record_stage_uavs(list, crate::capture::WriteKind::Dispatch, p, true);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -595,7 +610,18 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    {
+                        list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                            let op_index = list.next_op_index();
+                            self.record_input_trace(list, p, false, op_index, &self.targets);
+                            self.record_graphics_writes(
+                                list,
+                                crate::capture::WriteKind::DispatchMesh,
+                                p,
+                            );
+                        }
+                    }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -781,11 +807,15 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
-            .map(|t| {
+            .filter_map(|&resource| {
+                let resource = resource as This;
+                let texture = crate::resource::host_resource(resource)?;
                 // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                let d = unsafe { texture.GetDesc() };
+                Some(format!(
+                    "{}x{} f{} {resource:?}",
+                    d.Width, d.Height, d.Format.0
+                ))
             })
             .collect();
         let v = self.vertex[0];
@@ -854,7 +884,14 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            {
+                list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+                if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                    let op_index = list.next_op_index();
+                    self.record_input_trace(list, p, false, op_index, &self.targets);
+                    self.record_graphics_writes(list, crate::capture::WriteKind::Draw, p);
+                }
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -941,7 +978,14 @@ impl State {
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            {
+                list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+                if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                    let op_index = list.next_op_index();
+                    self.record_input_trace(list, p, false, op_index, &self.targets);
+                    self.record_graphics_writes(list, crate::capture::WriteKind::DrawIndexed, p);
+                }
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -971,30 +1015,40 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_drop(self.pipeline as This);
+            if kind == DISPATCH {
+                let (id, reason) = crate::pipeline::drop_summary(self.pipeline as This);
+                crate::capture::record_dropped_dispatch(&id, &reason);
+            }
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        let why = |pipeline: usize, what: &str| {
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+            if kind == DISPATCH {
+                let (id, _) = crate::pipeline::drop_summary(pipeline as This);
+                crate::capture::record_dropped_dispatch(&id, what);
+            }
+        };
         #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |_: usize, _: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
-            why("arguments outside title buffers");
+            why(self.pipeline, "arguments outside title buffers");
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
-                    why("count outside title buffers");
+                    why(self.pipeline, "count outside title buffers");
                     return false;
                 }
             },
@@ -1004,7 +1058,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why("no host signature");
+            why(self.pipeline, "no host signature");
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1013,7 +1067,10 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            why(
+                self.pipeline,
+                "not bounded (no clamp, or arguments not 4-byte aligned)",
+            );
             return false;
         }
         self.host_pipeline = 0;
@@ -1030,16 +1087,63 @@ impl State {
         if !ran {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            {
+                match crate::pipeline::host_pipeline(self.pipeline as This) {
+                    None => crate::pipeline::note_drop(self.pipeline as This),
+                    Some(p) => why(
+                        self.pipeline,
+                        &format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh),
+                    ),
+                }
+                if kind == DISPATCH {
+                    let (id, reason) = crate::pipeline::drop_summary(self.pipeline as This);
+                    crate::capture::record_dropped_dispatch(&id, &reason);
+                }
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
-        });
+        {
+            list.note_op(|| {
+                self.op_text(
+                    format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                    kind == DISPATCH,
+                )
+            });
+            if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                let op_index = list.next_op_index();
+                let targets = if kind == DISPATCH {
+                    &[][..]
+                } else {
+                    &self.targets[..]
+                };
+                self.record_input_trace(list, p, kind == DISPATCH, op_index, targets);
+                match kind {
+                    DRAW => self.record_graphics_writes(
+                        list,
+                        crate::capture::WriteKind::IndirectDraw,
+                        p,
+                    ),
+                    INDEXED => self.record_graphics_writes(
+                        list,
+                        crate::capture::WriteKind::IndirectIndexed,
+                        p,
+                    ),
+                    MESH => self.record_graphics_writes(
+                        list,
+                        crate::capture::WriteKind::IndirectMesh,
+                        p,
+                    ),
+                    DISPATCH => self.record_stage_uavs(
+                        list,
+                        crate::capture::WriteKind::IndirectDispatch,
+                        p,
+                        true,
+                    ),
+                    _ => {}
+                }
+            }
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1059,6 +1163,278 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn record_graphics_writes(
+        &self,
+        list: &HostList,
+        kind: crate::capture::WriteKind,
+        p: &HostPipeline,
+    ) {
+        for (slot, &target) in self.targets.iter().enumerate() {
+            let (width, height, format) = crate::capture::resource_dims(target as This);
+            list.record_write(crate::capture::WriteRecord {
+                target,
+                source: None,
+                kind,
+                slot: Some(slot as u32),
+                subresource: 0,
+                width,
+                height,
+                format,
+                pipeline: p.name.clone(),
+                submission: 0,
+                list_index: 0,
+                op_index: 0,
+                frame: 0,
+            });
+        }
+        if self.depth != 0 {
+            let (width, height, format) = crate::capture::resource_dims(self.depth as This);
+            list.record_write(crate::capture::WriteRecord {
+                target: self.depth,
+                source: None,
+                kind,
+                slot: None,
+                subresource: 0,
+                width,
+                height,
+                format,
+                pipeline: p.name.clone(),
+                submission: 0,
+                list_index: 0,
+                op_index: 0,
+                frame: 0,
+            });
+        }
+        self.record_stage_uavs(list, kind, p, false);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn record_stage_uavs(
+        &self,
+        list: &HostList,
+        kind: crate::capture::WriteKind,
+        p: &HostPipeline,
+        compute: bool,
+    ) {
+        for stage in &p.stages {
+            let t = stage.translated();
+            for u in &t.used {
+                if u.kind != ResourceType::Uav || u.root != RootType::Table {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(raw_view) = crate::descriptor::view(handle) else {
+                    continue;
+                };
+                let placed = crate::descriptor::host::placed_texture(&raw_view);
+                let view = placed.as_ref().unwrap_or(&raw_view);
+                match view {
+                    View::Unordered(resource, _, _) => {
+                        if crate::resource::host_resource(*resource as This).is_some() {
+                            let (width, height, format) =
+                                crate::capture::resource_dims(*resource as This);
+                            list.record_write(crate::capture::WriteRecord {
+                                target: *resource,
+                                source: None,
+                                kind,
+                                slot: Some(u.lower_bound),
+                                subresource: 0,
+                                width,
+                                height,
+                                format,
+                                pipeline: p.name.clone(),
+                                submission: 0,
+                                list_index: 0,
+                                op_index: 0,
+                                frame: 0,
+                            });
+                        } else if let Some((data, len)) =
+                            crate::resource::buffer_bytes(*resource as This)
+                        {
+                            list.record_write(crate::capture::WriteRecord {
+                                target: data as usize,
+                                source: None,
+                                kind,
+                                slot: Some(u.lower_bound),
+                                subresource: 0,
+                                width: len,
+                                height: 1,
+                                format: 0,
+                                pipeline: p.name.clone(),
+                                submission: 0,
+                                list_index: 0,
+                                op_index: 0,
+                                frame: 0,
+                            });
+                        }
+                    }
+                    View::Placed(true, resource, desc) if resource[0] == 1 => {
+                        let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+                        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                        if crate::shadow::find(address, len).is_some() {
+                            list.record_write(crate::capture::WriteRecord {
+                                target: address as usize,
+                                source: None,
+                                kind,
+                                slot: Some(u.lower_bound),
+                                subresource: 0,
+                                width: len,
+                                height: 1,
+                                format: 0,
+                                pipeline: p.name.clone(),
+                                submission: 0,
+                                list_index: 0,
+                                op_index: 0,
+                                frame: 0,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn record_input_trace(
+        &self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        op_index: u32,
+        initial_targets: &[usize],
+    ) {
+        let stage_hashes: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
+        if !crate::capture::should_trace_inputs(&p.name, &stage_hashes) {
+            return;
+        }
+        let mut inputs = Vec::new();
+        let mut targets = initial_targets.to_vec();
+        for stage in &p.stages {
+            let t = stage.translated();
+            for u in &t.used {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(raw_view) = crate::descriptor::view(handle) else {
+                    continue;
+                };
+                let placed = crate::descriptor::host::placed_texture(&raw_view);
+                let view = placed.as_ref().unwrap_or(&raw_view);
+                let resolved = match (u.kind, view) {
+                    (ResourceType::Srv, View::Shader(res, _)) => {
+                        if crate::resource::host_resource(*res as This).is_some() {
+                            Some((crate::capture::InputKind::Srv, *res, false, 0))
+                        } else {
+                            crate::resource::buffer_bytes(*res as This).map(|(data, len)| {
+                                (crate::capture::InputKind::Srv, data as usize, true, len)
+                            })
+                        }
+                    }
+                    (ResourceType::Srv, View::Placed(false, res, desc)) if res[0] == 1 => {
+                        let len = u64::from(res[4]) | u64::from(res[5]) << 32;
+                        let addr = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                        Some((crate::capture::InputKind::Srv, addr as usize, true, len))
+                    }
+                    (ResourceType::Cbv, View::Constant(addr, size)) => Some((
+                        crate::capture::InputKind::Cbv,
+                        *addr as usize,
+                        true,
+                        u64::from(*size),
+                    )),
+                    (ResourceType::Uav, View::Unordered(res, _, _)) => {
+                        if crate::resource::host_resource(*res as This).is_some() {
+                            if !targets.contains(res) {
+                                targets.push(*res);
+                            }
+                            Some((crate::capture::InputKind::Uav, *res, false, 0))
+                        } else {
+                            crate::resource::buffer_bytes(*res as This).map(|(data, len)| {
+                                if !targets.contains(&(data as usize)) {
+                                    targets.push(data as usize);
+                                }
+                                (crate::capture::InputKind::Uav, data as usize, true, len)
+                            })
+                        }
+                    }
+                    (ResourceType::Uav, View::Placed(true, res, desc)) if res[0] == 1 => {
+                        let len = u64::from(res[4]) | u64::from(res[5]) << 32;
+                        let addr = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                        if !targets.contains(&(addr as usize)) {
+                            targets.push(addr as usize);
+                        }
+                        Some((crate::capture::InputKind::Uav, addr as usize, true, len))
+                    }
+                    _ => None,
+                };
+                if let Some((kind, resource, is_buffer, size)) = resolved {
+                    let entry = crate::capture::BoundInput {
+                        kind,
+                        stage: stage.shader.stage,
+                        slot: u.lower_bound,
+                        resource,
+                        is_buffer,
+                        size,
+                    };
+                    if !inputs.contains(&entry) {
+                        inputs.push(entry);
+                    }
+                }
+            }
+            for &(slot, _) in &stage.root_cbvs {
+                if let Some(Root::View(addr)) = self.roots_ref(compute).get(usize::from(slot)) {
+                    let entry = crate::capture::BoundInput {
+                        kind: crate::capture::InputKind::Cbv,
+                        stage: stage.shader.stage,
+                        slot: u32::from(slot),
+                        resource: *addr as usize,
+                        is_buffer: true,
+                        size: 0,
+                    };
+                    if !inputs.contains(&entry) {
+                        inputs.push(entry);
+                    }
+                }
+            }
+            for &(slot, _) in &stage.root_srvs {
+                if let Some(Root::View(addr)) = self.roots_ref(compute).get(usize::from(slot)) {
+                    let entry = crate::capture::BoundInput {
+                        kind: crate::capture::InputKind::Srv,
+                        stage: stage.shader.stage,
+                        slot: u32::from(slot),
+                        resource: *addr as usize,
+                        is_buffer: true,
+                        size: 0,
+                    };
+                    if !inputs.contains(&entry) {
+                        inputs.push(entry);
+                    }
+                }
+            }
+        }
+        if !inputs.is_empty() {
+            list.record_input_trace(crate::capture::InputTrace {
+                pipeline: p.name.clone(),
+                targets,
+                inputs,
+                submission: 0,
+                list_index: 0,
+                op_index,
+                frame: 0,
+            });
+        }
     }
 }
 

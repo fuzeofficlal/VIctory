@@ -116,12 +116,18 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        if self.stage == "compute" {
+                            crate::capture::record_dropped_compute(&self.hash, self.stage, e);
+                        }
+                    }
                 }
                 done.ok()
             })
@@ -269,6 +275,25 @@ pub(crate) fn note_drop(this: This) {
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn drop_summary(this: This) -> (String, String) {
+    if this.is_null() {
+        return ("null".to_owned(), "no pipeline set".to_owned());
+    }
+    let p = pipeline(this);
+    let id = p
+        .shaders
+        .iter()
+        .map(|s| format!("{} {}", s.stage, s.hash))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let reason = skipped_shader(p)
+        .map(|hash| format!("skipped shader {hash}"))
+        .or_else(|| make::missing(&p.host))
+        .unwrap_or_else(|| "missing host pipeline".to_owned());
+    (id, reason)
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -622,3 +647,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod present_correlation_test;

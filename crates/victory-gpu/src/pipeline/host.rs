@@ -324,6 +324,18 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
+            #[cfg(feature = "diagnostics")]
+            if s.translated().is_none() {
+                if compute.is_some() {
+                    crate::capture::record_dropped_compute(
+                        &s.hash,
+                        s.stage,
+                        "shader translation failed",
+                    );
+                }
+                return None;
+            }
+            #[cfg(not(feature = "diagnostics"))]
             s.translated()?;
         }
         let host = host()?;
@@ -405,6 +417,14 @@ impl HostPipeline {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                #[cfg(feature = "diagnostics")]
+                if let Some(cs) = compute {
+                    crate::capture::record_dropped_compute(
+                        &cs.hash,
+                        "compute root signature",
+                        &e.to_string(),
+                    );
+                }
                 return None;
             }
         };
@@ -437,6 +457,14 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(cs) = compute {
+                        crate::capture::record_dropped_compute(
+                            &cs.hash,
+                            "compute PSO",
+                            &e.to_string(),
+                        );
+                    }
                     return None;
                 }
             };

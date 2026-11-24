@@ -272,7 +272,11 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
+    let listed = crate::capture::listed(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let trace_present = listed || crate::capture::present_source_trace_on();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if listed {
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
@@ -286,6 +290,31 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        #[cfg(feature = "diagnostics")]
+        if trace_present {
+            // SAFETY: a live resource.
+            let desc = unsafe { texture.GetDesc() };
+            if listed {
+                crate::capture::present_source(frame, 0, 0, resource, &desc);
+                tracing::info!(
+                    frame,
+                    planes,
+                    sources = 1usize,
+                    "present plane selection"
+                );
+            }
+            crate::capture::correlate_present(
+                frame,
+                &[crate::capture::PresentPlane {
+                    plane: 0,
+                    composition_index: 0,
+                    resource: resource as usize,
+                    width: desc.Width,
+                    height: desc.Height,
+                    format: desc.Format.0 as u32,
+                }],
+            );
+        }
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
@@ -298,6 +327,8 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::end_frame(frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

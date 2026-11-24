@@ -431,6 +431,22 @@ extern "system" fn copy_buffer_region(
         && let Some(from) = buffer_range(src, src_offset, len)
     {
         list.defer_copy(to, from, len as usize);
+        #[cfg(feature = "diagnostics")]
+        list.record_write(crate::capture::WriteRecord {
+            target: to as usize,
+            source: Some(from as usize),
+            kind: crate::capture::WriteKind::CopyBufferRegion,
+            slot: None,
+            subresource: 0,
+            width: len,
+            height: 1,
+            format: 0,
+            pipeline: String::new(),
+            submission: 0,
+            list_index: 0,
+            op_index: 0,
+            frame: 0,
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -453,14 +469,50 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            {
+                list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+                // SAFETY: a live host texture.
+                let d = unsafe { to.GetDesc() };
+                list.record_write(crate::capture::WriteRecord {
+                    target: dst as usize,
+                    source: Some(src as usize),
+                    kind: crate::capture::WriteKind::CopyResource,
+                    slot: None,
+                    subresource: 0,
+                    width: d.Width,
+                    height: d.Height,
+                    format: d.Format.0 as u32,
+                    pipeline: String::new(),
+                    submission: 0,
+                    list_index: 0,
+                    op_index: 0,
+                    frame: 0,
+                });
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            let bytes = a.min(b);
+            list.defer_copy(to, from, bytes as usize);
+            #[cfg(feature = "diagnostics")]
+            list.record_write(crate::capture::WriteRecord {
+                target: to as usize,
+                source: Some(from as usize),
+                kind: crate::capture::WriteKind::CopyResource,
+                slot: None,
+                subresource: 0,
+                width: bytes,
+                height: 1,
+                format: 0,
+                pipeline: String::new(),
+                submission: 0,
+                list_index: 0,
+                op_index: 0,
+                frame: 0,
+            });
         }
     }
     #[cfg(not(windows))]
@@ -572,6 +624,27 @@ extern "system" fn copy_texture_region(
                 Some(range) => list.note_read(text, range),
                 None => list.note_op(text),
             }
+            // SAFETY: a live host texture.
+            let d = unsafe { to.GetDesc() };
+            list.record_write(crate::capture::WriteRecord {
+                target: dst.resource as usize,
+                source: (src.kind != FOOTPRINT).then_some(src.resource as usize),
+                kind: crate::capture::WriteKind::CopyTextureRegion,
+                slot: None,
+                subresource: if dst.kind == 0 {
+                    dst.footprint.offset as u32
+                } else {
+                    0
+                },
+                width: d.Width,
+                height: d.Height,
+                format: d.Format.0 as u32,
+                pipeline: String::new(),
+                submission: 0,
+                list_index: 0,
+                op_index: 0,
+                frame: 0,
+            });
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
@@ -638,9 +711,11 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
+            let mut resolved = false;
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
+                resolved = true;
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
@@ -660,7 +735,28 @@ extern "system" fn resolve(
                     format,
                     D3D12_RESOLVE_MODE_AVERAGE,
                 );
+                resolved = true;
             }
+            #[cfg(feature = "diagnostics")]
+            if resolved {
+                list.record_write(crate::capture::WriteRecord {
+                    target: dst as usize,
+                    source: Some(src as usize),
+                    kind: crate::capture::WriteKind::ResolveSubresource,
+                    slot: None,
+                    subresource: dst_sub,
+                    width: a.Width,
+                    height: a.Height,
+                    format: a.Format.0 as u32,
+                    pipeline: String::new(),
+                    submission: 0,
+                    list_index: 0,
+                    op_index: 0,
+                    frame: 0,
+                });
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = resolved;
         }
     }
     #[cfg(not(windows))]
@@ -715,6 +811,25 @@ extern "system" fn clear_rtv(
                 )]);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
+            #[cfg(feature = "diagnostics")]
+            {
+                let d = texture.GetDesc();
+                list.record_write(crate::capture::WriteRecord {
+                    target: record.resource as usize,
+                    source: None,
+                    kind: crate::capture::WriteKind::ClearRtv,
+                    slot: None,
+                    subresource: 0,
+                    width: d.Width,
+                    height: d.Height,
+                    format: d.Format.0 as u32,
+                    pipeline: String::new(),
+                    submission: 0,
+                    list_index: 0,
+                    op_index: 0,
+                    frame: 0,
+                });
+            }
         }
     }
     #[cfg(not(windows))]
@@ -755,8 +870,27 @@ extern "system" fn clear_dsv(
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
-        };
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects);
+            #[cfg(feature = "diagnostics")]
+            {
+                let d = texture.GetDesc();
+                list.record_write(crate::capture::WriteRecord {
+                    target: record.resource as usize,
+                    source: None,
+                    kind: crate::capture::WriteKind::ClearDsv,
+                    slot: None,
+                    subresource: 0,
+                    width: d.Width,
+                    height: d.Height,
+                    format: d.Format.0 as u32,
+                    pipeline: String::new(),
+                    submission: 0,
+                    list_index: 0,
+                    op_index: 0,
+                    frame: 0,
+                });
+            }
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);

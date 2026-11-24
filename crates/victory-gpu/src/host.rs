@@ -301,6 +301,14 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Host GPU target/UAV writes recorded onto this list, committed to
+    /// `capture` only after GPU execution finishes.
+    #[cfg(feature = "diagnostics")]
+    writes: Mutex<Vec<crate::capture::WriteRecord>>,
+    /// Bound SRV/CBV/UAV inputs recorded for watched draws/dispatches on
+    /// this list, correlated in `capture` after GPU execution finishes.
+    #[cfg(feature = "diagnostics")]
+    input_traces: Mutex<Vec<crate::capture::InputTrace>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -482,6 +490,10 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
+                writes: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                input_traces: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
@@ -524,8 +536,14 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        let mut list_submissions = Vec::with_capacity(runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 {
+                list_submissions.push(*submitted);
+            }
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -553,6 +571,10 @@ impl Host {
             }
             let _ = (i, started);
         }
+        #[cfg(feature = "diagnostics")]
+        if list_submissions.is_empty() {
+            list_submissions.resize(runs.len(), *submitted);
+        }
         let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -573,6 +595,33 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let frame = crate::queue::presented() + 1;
+            for (list_idx, list) in runs.iter().enumerate() {
+                let writes =
+                    std::mem::take(&mut *list.writes.lock().unwrap_or_else(|e| e.into_inner()));
+                let traces = std::mem::take(
+                    &mut *list.input_traces.lock().unwrap_or_else(|e| e.into_inner()),
+                );
+                if !writes.is_empty() {
+                    crate::capture::commit_writes(
+                        frame,
+                        list_submissions[list_idx],
+                        list_idx,
+                        &writes,
+                    );
+                }
+                if !traces.is_empty() {
+                    crate::capture::commit_input_traces(
+                        frame,
+                        list_submissions[list_idx],
+                        list_idx,
+                        &traces,
+                    );
+                }
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -884,7 +933,14 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            self.writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.input_traces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1006,6 +1062,26 @@ impl HostList {
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn next_op_index(&self) -> u32 {
+        self.writes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn record_write(&self, mut record: crate::capture::WriteRecord) {
+        let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        record.op_index = writes.len() as u32;
+        writes.push(record);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn record_input_trace(&self, trace: crate::capture::InputTrace) {
+        self.input_traces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(trace);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {

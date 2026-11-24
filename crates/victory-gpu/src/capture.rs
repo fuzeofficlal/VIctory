@@ -29,6 +29,604 @@ pub(crate) fn listed(n: u64) -> bool {
     .contains(&n)
 }
 
+/// A plane selected for this frame, with the same resource ID as its target dump.
+pub(crate) fn present_source(
+    frame: u64,
+    plane: usize,
+    composition_index: usize,
+    resource: crate::object::This,
+    desc: &D3D12_RESOURCE_DESC,
+) {
+    tracing::info!(
+        frame,
+        plane,
+        composition_index,
+        ?resource,
+        width = desc.Width,
+        height = desc.Height,
+        format = desc.Format.0,
+        "present source"
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteKind {
+    ClearRtv,
+    ClearDsv,
+    Draw,
+    DrawIndexed,
+    DispatchMesh,
+    Dispatch,
+    IndirectDraw,
+    IndirectIndexed,
+    IndirectMesh,
+    IndirectDispatch,
+    CopyResource,
+    CopyTextureRegion,
+    CopyBufferRegion,
+    ResolveSubresource,
+    TextureUpload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteRecord {
+    pub(crate) target: usize,
+    pub(crate) source: Option<usize>,
+    pub(crate) kind: WriteKind,
+    pub(crate) slot: Option<u32>,
+    pub(crate) subresource: u32,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) format: u32,
+    pub(crate) pipeline: String,
+    pub(crate) submission: u64,
+    pub(crate) list_index: usize,
+    pub(crate) op_index: u32,
+    pub(crate) frame: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PresentPlane {
+    pub(crate) plane: usize,
+    pub(crate) composition_index: usize,
+    pub(crate) resource: usize,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) format: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputKind {
+    Srv,
+    Cbv,
+    Uav,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundInput {
+    pub(crate) kind: InputKind,
+    pub(crate) stage: &'static str,
+    pub(crate) slot: u32,
+    pub(crate) resource: usize,
+    pub(crate) is_buffer: bool,
+    pub(crate) size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedCompute {
+    pub(crate) hash: String,
+    pub(crate) stage_or_kind: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedDispatch {
+    pub(crate) pipeline: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputTrace {
+    pub(crate) pipeline: String,
+    pub(crate) targets: Vec<usize>,
+    pub(crate) inputs: Vec<BoundInput>,
+    pub(crate) submission: u64,
+    pub(crate) list_index: usize,
+    pub(crate) op_index: u32,
+    pub(crate) frame: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputProvenance {
+    pub(crate) input: BoundInput,
+    pub(crate) writer: Option<WriteRecord>,
+    pub(crate) chain: Vec<WriteRecord>,
+    pub(crate) status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrawInputReport {
+    pub(crate) frame: u64,
+    pub(crate) pipeline: String,
+    pub(crate) targets: Vec<usize>,
+    pub(crate) submission: u64,
+    pub(crate) list_index: usize,
+    pub(crate) op_index: u32,
+    pub(crate) inputs: Vec<InputProvenance>,
+}
+
+static LAST_WRITERS: std::sync::Mutex<Option<std::collections::HashMap<usize, WriteRecord>>> =
+    std::sync::Mutex::new(None);
+static FRAME_WRITES: std::sync::Mutex<Vec<WriteRecord>> = std::sync::Mutex::new(Vec::new());
+static DROPPED_COMPUTES: std::sync::Mutex<Vec<DroppedCompute>> = std::sync::Mutex::new(Vec::new());
+static DROPPED_DISPATCHES: std::sync::Mutex<Vec<DroppedDispatch>> =
+    std::sync::Mutex::new(Vec::new());
+static INPUT_REPORTS: std::sync::Mutex<Vec<DrawInputReport>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn present_source_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_SOURCE_TRACE").is_some())
+}
+
+fn parse_env_filters(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn trace_inputs_pso_filters() -> &'static [String] {
+    static FILTERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FILTERS.get_or_init(|| parse_env_filters("VICTORY_TRACE_INPUTS_PSO"))
+}
+
+fn trace_inputs_vs_filters() -> &'static [String] {
+    static FILTERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FILTERS.get_or_init(|| parse_env_filters("VICTORY_TRACE_INPUTS_VS"))
+}
+
+pub(crate) fn should_trace_inputs(pipeline_name: &str, stage_hashes: &[&str]) -> bool {
+    if present_source_trace_on() {
+        return true;
+    }
+    let pso_filters = trace_inputs_pso_filters();
+    if !pso_filters.is_empty() {
+        let lower = pipeline_name.to_ascii_lowercase();
+        if pso_filters.iter().any(|f| lower.contains(f)) {
+            return true;
+        }
+    }
+    let vs_filters = trace_inputs_vs_filters();
+    if !vs_filters.is_empty() {
+        for hash in stage_hashes {
+            let lower = hash.to_ascii_lowercase();
+            if vs_filters.iter().any(|f| lower.contains(f)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn record_dropped_compute(hash: &str, stage_or_kind: &str, reason: &str) {
+    let mut dropped = DROPPED_COMPUTES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = dropped
+        .iter_mut()
+        .find(|d| d.hash == hash && d.stage_or_kind == stage_or_kind)
+    {
+        if existing.reason == "shader translation failed" && reason != "shader translation failed" {
+            existing.reason = reason.to_owned();
+        }
+        return;
+    }
+    if dropped.len() < 256 {
+        dropped.push(DroppedCompute {
+            hash: hash.to_owned(),
+            stage_or_kind: stage_or_kind.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+}
+
+pub(crate) fn record_dropped_dispatch(pipeline: &str, reason: &str) {
+    let mut dropped = DROPPED_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
+    if dropped
+        .iter()
+        .any(|d| d.pipeline == pipeline && d.reason == reason)
+    {
+        return;
+    }
+    if dropped.len() < 256 {
+        dropped.push(DroppedDispatch {
+            pipeline: pipeline.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+}
+
+pub(crate) fn resource_dims(resource: crate::object::This) -> (u64, u32, u32) {
+    let Some(tex) = crate::resource::host_resource(resource) else {
+        return (0, 0, 0);
+    };
+    // SAFETY: a live host resource.
+    let d = unsafe { tex.GetDesc() };
+    (d.Width, d.Height, d.Format.0 as u32)
+}
+
+/// Commits writes recorded on a host command list after GPU execution succeeds.
+pub(crate) fn commit_writes(frame: u64, submission: u64, list_index: usize, writes: &[WriteRecord]) {
+    if writes.is_empty() {
+        return;
+    }
+    let mut ordered = writes.to_vec();
+    ordered.sort_by_key(|w| w.op_index);
+    let mut last = LAST_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = last.get_or_insert_with(std::collections::HashMap::new);
+    let mut frame_writes = FRAME_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    for mut record in ordered {
+        record.frame = frame;
+        record.submission = submission;
+        record.list_index = list_index;
+        map.insert(record.target, record.clone());
+        frame_writes.push(record);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn last_writer(resource: usize) -> Option<WriteRecord> {
+    LAST_WRITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()?
+        .get(&resource)
+        .cloned()
+}
+
+fn write_matches_input(w: &WriteRecord, resource: usize, is_buffer: bool) -> bool {
+    w.target == resource
+        || (is_buffer
+            && w.height == 1
+            && w.format == 0
+            && w.width > 0
+            && resource >= w.target
+            && (resource - w.target) < w.width as usize)
+}
+
+fn prior_write(
+    frame_writes: &[WriteRecord],
+    last_map: &std::collections::HashMap<usize, WriteRecord>,
+    resource: usize,
+    is_buffer: bool,
+    before: (u64, usize, u32),
+) -> Option<WriteRecord> {
+    frame_writes
+        .iter()
+        .rev()
+        .find(|w| {
+            (w.submission, w.list_index, w.op_index) < before
+                && write_matches_input(w, resource, is_buffer)
+        })
+        .cloned()
+        .or_else(|| {
+            last_map
+                .values()
+                .filter(|w| {
+                    (w.submission, w.list_index, w.op_index) < before
+                        && write_matches_input(w, resource, is_buffer)
+                })
+                .max_by_key(|w| (w.submission, w.list_index, w.op_index))
+                .cloned()
+        })
+}
+
+fn trace_chain_from(
+    first: WriteRecord,
+    max_depth: usize,
+    frame_writes: &[WriteRecord],
+    last_map: &std::collections::HashMap<usize, WriteRecord>,
+) -> Vec<WriteRecord> {
+    if max_depth == 0 {
+        return Vec::new();
+    }
+    let mut chain = Vec::with_capacity(max_depth.min(16));
+    chain.push(first);
+    while chain.len() < max_depth {
+        let current = &chain[chain.len() - 1];
+        let Some(src) = current.source else {
+            break;
+        };
+        let cur_order = (current.submission, current.list_index, current.op_index);
+        match prior_write(frame_writes, last_map, src, false, cur_order) {
+            Some(record) => chain.push(record),
+            None => break,
+        }
+    }
+    chain
+}
+
+/// Walks committed `source` links backward with strictly decreasing
+/// `(submission, list_index, op_index)` order and a depth cap so ping-pong
+/// double-buffer chains (`A -> B -> A`) resolve without looping.
+pub(crate) fn writer_chain(resource: usize, max_depth: usize) -> Vec<WriteRecord> {
+    if max_depth == 0 {
+        return Vec::new();
+    }
+    let last = LAST_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = last.as_ref() else {
+        return Vec::new();
+    };
+    let frame_writes = FRAME_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(first) = map.get(&resource).cloned() else {
+        return Vec::new();
+    };
+    trace_chain_from(first, max_depth, &frame_writes, map)
+}
+
+fn format_dropped_upstream_tags(
+    computes: &[DroppedCompute],
+    dispatches: &[DroppedDispatch],
+) -> String {
+    let mut status = String::from("never host-written");
+    if !computes.is_empty() {
+        let list: Vec<String> = computes
+            .iter()
+            .take(8)
+            .map(|c| format!("{} {} ({})", c.stage_or_kind, c.hash, c.reason))
+            .collect();
+        status.push_str("; dropped upstream CS translation: ");
+        status.push_str(&list.join(", "));
+    }
+    if !dispatches.is_empty() {
+        let list: Vec<String> = dispatches
+            .iter()
+            .take(8)
+            .map(|d| format!("{} ({})", d.pipeline, d.reason))
+            .collect();
+        status.push_str("; dropped upstream dispatch: ");
+        status.push_str(&list.join(", "));
+    }
+    status
+}
+
+/// Correlates bound SRV/CBV/UAV inputs recorded for draws/dispatches against
+/// strictly earlier committed `WriteRecord`s and upstream dropped CS/dispatches.
+pub(crate) fn commit_input_traces(
+    frame: u64,
+    submission: u64,
+    list_index: usize,
+    traces: &[InputTrace],
+) {
+    if traces.is_empty() {
+        return;
+    }
+    let last = LAST_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let empty_map = std::collections::HashMap::new();
+    let last_map = last.as_ref().unwrap_or(&empty_map);
+    let frame_writes = FRAME_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    let dropped_computes = DROPPED_COMPUTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let dropped_dispatches = DROPPED_DISPATCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut reports = INPUT_REPORTS.lock().unwrap_or_else(|e| e.into_inner());
+
+    for trace in traces {
+        let order = (submission, list_index, trace.op_index);
+        let mut provenances = Vec::with_capacity(trace.inputs.len());
+        for input in &trace.inputs {
+            let writer = prior_write(
+                &frame_writes,
+                last_map,
+                input.resource,
+                input.is_buffer,
+                order,
+            );
+            let (chain, status) = match &writer {
+                Some(w) => {
+                    let chain = trace_chain_from(w.clone(), 8, &frame_writes, last_map);
+                    let status = format!("host-written by {:?} ({})", w.kind, w.pipeline);
+                    tracing::info!(
+                        frame,
+                        pipeline = %trace.pipeline,
+                        stage = input.stage,
+                        input_kind = ?input.kind,
+                        slot = input.slot,
+                        resource = format_args!("{:#x}", input.resource),
+                        is_buffer = input.is_buffer,
+                        writer_kind = ?w.kind,
+                        writer_pipeline = %w.pipeline,
+                        chain_len = chain.len(),
+                        status = %status,
+                        "bound input provenance"
+                    );
+                    (chain, status)
+                }
+                None => {
+                    let status =
+                        format_dropped_upstream_tags(&dropped_computes, &dropped_dispatches);
+                    tracing::info!(
+                        frame,
+                        pipeline = %trace.pipeline,
+                        stage = input.stage,
+                        input_kind = ?input.kind,
+                        slot = input.slot,
+                        resource = format_args!("{:#x}", input.resource),
+                        is_buffer = input.is_buffer,
+                        status = %status,
+                        "bound input provenance"
+                    );
+                    (Vec::new(), status)
+                }
+            };
+            provenances.push(InputProvenance {
+                input: input.clone(),
+                writer,
+                chain,
+                status,
+            });
+        }
+        reports.push(DrawInputReport {
+            frame,
+            pipeline: trace.pipeline.clone(),
+            targets: trace.targets.clone(),
+            submission,
+            list_index,
+            op_index: trace.op_index,
+            inputs: provenances,
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn input_reports(frame: u64) -> Vec<DrawInputReport> {
+    INPUT_REPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|r| r.frame == frame)
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn correlate_present(frame: u64, planes: &[PresentPlane]) {
+    let dropped_computes = DROPPED_COMPUTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let dropped_dispatches = DROPPED_DISPATCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let reports: Vec<DrawInputReport> = INPUT_REPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|r| r.frame == frame)
+        .cloned()
+        .collect();
+
+    for p in planes {
+        let chain = writer_chain(p.resource, 8);
+        if chain.is_empty() {
+            let status = format_dropped_upstream_tags(&dropped_computes, &dropped_dispatches);
+            tracing::info!(
+                frame,
+                plane = p.plane,
+                composition_index = p.composition_index,
+                resource = format_args!("{:#x}", p.resource),
+                width = p.width,
+                height = p.height,
+                format = p.format,
+                status = %status,
+                "present source has no recorded writer"
+            );
+        } else {
+            let steps: Vec<String> = chain
+                .iter()
+                .map(|w| {
+                    format!(
+                        "{:?}({:#x}<-{:?} {}x{} f{} slot={:?} sub={} sub#={} list#={} op#={} frame={} {})",
+                        w.kind,
+                        w.target,
+                        w.source.map(|s| format!("{s:#x}")),
+                        w.width,
+                        w.height,
+                        w.format,
+                        w.slot,
+                        w.subresource,
+                        w.submission,
+                        w.list_index,
+                        w.op_index,
+                        w.frame,
+                        w.pipeline
+                    )
+                })
+                .collect();
+            tracing::info!(
+                frame,
+                plane = p.plane,
+                composition_index = p.composition_index,
+                resource = format_args!("{:#x}", p.resource),
+                width = p.width,
+                height = p.height,
+                format = p.format,
+                chain = ?steps,
+                "present source writer chain"
+            );
+            for w in &chain {
+                for r in reports
+                    .iter()
+                    .filter(|r| r.targets.contains(&w.target) && r.submission == w.submission)
+                {
+                    let summary: Vec<String> = r
+                        .inputs
+                        .iter()
+                        .map(|ip| {
+                            format!(
+                                "{:?}:{}@{:#x}=>{}",
+                                ip.input.kind, ip.input.slot, ip.input.resource, ip.status
+                            )
+                        })
+                        .collect();
+                    tracing::info!(
+                        frame,
+                        target = format_args!("{:#x}", w.target),
+                        pipeline = %r.pipeline,
+                        inputs = ?summary,
+                        "present source upstream input provenance"
+                    );
+                }
+            }
+        }
+    }
+    let candidates: Vec<WriteRecord> = {
+        let writes = FRAME_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by_target: Vec<WriteRecord> = Vec::new();
+        for w in writes.iter().filter(|w| w.frame == frame) {
+            if let Some(existing) = by_target.iter_mut().find(|e| e.target == w.target) {
+                *existing = w.clone();
+            } else {
+                by_target.push(w.clone());
+            }
+        }
+        by_target
+    };
+    for c in &candidates {
+        tracing::info!(
+            frame,
+            target = format_args!("{:#x}", c.target),
+            source = ?c.source.map(|s| format!("{s:#x}")),
+            kind = ?c.kind,
+            width = c.width,
+            height = c.height,
+            format = c.format,
+            slot = ?c.slot,
+            subresource = c.subresource,
+            submission = c.submission,
+            list_index = c.list_index,
+            op_index = c.op_index,
+            pipeline = %c.pipeline,
+            "present frame candidate target"
+        );
+    }
+}
+
+pub(crate) fn end_frame(frame: u64) {
+    FRAME_WRITES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|w| w.frame > frame);
+    INPUT_REPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|r| r.frame > frame);
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some() && (n.is_power_of_two() || listed(n))
@@ -520,6 +1118,33 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn synthetic_write(
+        target: usize,
+        source: Option<usize>,
+        kind: WriteKind,
+        slot: Option<u32>,
+        op_index: u32,
+        pipeline: &str,
+    ) -> WriteRecord {
+        WriteRecord {
+            target,
+            source,
+            kind,
+            slot,
+            subresource: 0,
+            width: 64,
+            height: 64,
+            format: 28,
+            pipeline: pipeline.to_owned(),
+            submission: 0,
+            list_index: 0,
+            op_index,
+            frame: 0,
+        }
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
@@ -537,5 +1162,307 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn commit_writes_orders_deterministically_across_lists() {
+        let target = 0x1000_0001usize;
+        // Out-of-order op_index inside list 0, followed by list 1.
+        let list0 = vec![
+            synthetic_write(target, None, WriteKind::Draw, Some(0), 2, "draw_late"),
+            synthetic_write(target, None, WriteKind::ClearRtv, None, 0, ""),
+        ];
+        let list1 = vec![
+            synthetic_write(target, Some(0x1000_0002), WriteKind::CopyResource, None, 0, ""),
+            synthetic_write(
+                target,
+                Some(0x1000_0003),
+                WriteKind::ResolveSubresource,
+                None,
+                1,
+                "",
+            ),
+        ];
+        commit_writes(7, 10, 0, &list0);
+        commit_writes(7, 10, 1, &list1);
+
+        let last = last_writer(target).expect("target must have a committed last writer");
+        assert_eq!(last.kind, WriteKind::ResolveSubresource);
+        assert_eq!(last.source, Some(0x1000_0003));
+        assert_eq!(
+            (last.frame, last.submission, last.list_index, last.op_index),
+            (7, 10, 1, 1)
+        );
+
+        let committed: Vec<WriteRecord> = FRAME_WRITES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|w| w.target == target)
+            .cloned()
+            .collect();
+        let order: Vec<(u64, usize, u32, WriteKind)> = committed
+            .iter()
+            .map(|w| (w.submission, w.list_index, w.op_index, w.kind))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (10, 0, 0, WriteKind::ClearRtv),
+                (10, 0, 2, WriteKind::Draw),
+                (10, 1, 0, WriteKind::CopyResource),
+                (10, 1, 1, WriteKind::ResolveSubresource),
+            ]
+        );
+        end_frame(7);
+    }
+
+    #[test]
+    fn writer_chain_traces_draw_dispatch_copy_and_resolve() {
+        let rtv = 0x2000_0001usize;
+        let uav = 0x2000_0002usize;
+        let copied = 0x2000_0003usize;
+        let msaa = 0x2000_0004usize;
+        let resolved = 0x2000_0005usize;
+
+        commit_writes(
+            8,
+            20,
+            0,
+            &[
+                synthetic_write(rtv, None, WriteKind::Draw, Some(0), 0, "gbuffer_vs_ps"),
+                synthetic_write(uav, Some(rtv), WriteKind::Dispatch, Some(0), 1, "post_cs"),
+                synthetic_write(copied, Some(uav), WriteKind::CopyTextureRegion, None, 2, ""),
+                synthetic_write(msaa, Some(copied), WriteKind::DrawIndexed, Some(0), 3, "msaa_ps"),
+                synthetic_write(resolved, Some(msaa), WriteKind::ResolveSubresource, None, 4, ""),
+            ],
+        );
+
+        let chain = writer_chain(resolved, 8);
+        let kinds: Vec<(usize, WriteKind, Option<usize>)> =
+            chain.iter().map(|w| (w.target, w.kind, w.source)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (resolved, WriteKind::ResolveSubresource, Some(msaa)),
+                (msaa, WriteKind::DrawIndexed, Some(copied)),
+                (copied, WriteKind::CopyTextureRegion, Some(uav)),
+                (uav, WriteKind::Dispatch, Some(rtv)),
+                (rtv, WriteKind::Draw, None),
+            ]
+        );
+        assert_eq!(writer_chain(resolved, 2).len(), 2);
+        assert!(writer_chain(resolved, 0).is_empty());
+        end_frame(8);
+    }
+
+    #[test]
+    fn writer_chain_ping_pong_double_buffer_terminates_monotonically() {
+        let buf_a = 0x3000_0001usize;
+        let buf_b = 0x3000_0002usize;
+
+        // Frame 9: Draw -> A, then ping-pong A -> B -> A -> B -> A.
+        commit_writes(
+            9,
+            30,
+            0,
+            &[
+                synthetic_write(buf_a, None, WriteKind::Draw, Some(0), 0, "base_pass"),
+                synthetic_write(buf_b, Some(buf_a), WriteKind::Dispatch, Some(0), 1, "taa_0"),
+                synthetic_write(buf_a, Some(buf_b), WriteKind::CopyResource, None, 2, ""),
+            ],
+        );
+        commit_writes(
+            9,
+            30,
+            1,
+            &[
+                synthetic_write(buf_b, Some(buf_a), WriteKind::Dispatch, Some(0), 0, "taa_1"),
+                synthetic_write(buf_a, Some(buf_b), WriteKind::CopyTextureRegion, None, 1, ""),
+            ],
+        );
+
+        let chain = writer_chain(buf_a, 8);
+        let trace: Vec<(usize, WriteKind, usize, u32, Option<usize>)> = chain
+            .iter()
+            .map(|w| (w.target, w.kind, w.list_index, w.op_index, w.source))
+            .collect();
+        assert_eq!(
+            trace,
+            vec![
+                (buf_a, WriteKind::CopyTextureRegion, 1, 1, Some(buf_b)),
+                (buf_b, WriteKind::Dispatch, 1, 0, Some(buf_a)),
+                (buf_a, WriteKind::CopyResource, 0, 2, Some(buf_b)),
+                (buf_b, WriteKind::Dispatch, 0, 1, Some(buf_a)),
+                (buf_a, WriteKind::Draw, 0, 0, None),
+            ]
+        );
+
+        // Enforce depth cap even inside a ping-pong sequence.
+        assert_eq!(writer_chain(buf_a, 3).len(), 3);
+        end_frame(9);
+
+        // Same-frame monotonic guard: a newer write to A must never be pulled
+        // in as the historical source of an earlier write to B, while an
+        // earlier write in the frame IS found.
+        commit_writes(
+            10,
+            31,
+            0,
+            &[
+                synthetic_write(buf_a, None, WriteKind::Draw, Some(0), 0, "earlier"),
+                synthetic_write(buf_b, Some(buf_a), WriteKind::CopyResource, None, 1, ""),
+                synthetic_write(buf_a, None, WriteKind::ClearRtv, None, 2, ""),
+            ],
+        );
+        let b_chain = writer_chain(buf_b, 8);
+        assert_eq!(b_chain.len(), 2);
+        assert_eq!((b_chain[0].submission, b_chain[0].op_index), (31, 1));
+        assert_eq!(
+            (b_chain[1].submission, b_chain[1].op_index, b_chain[1].kind),
+            (31, 0, WriteKind::Draw)
+        );
+        end_frame(10);
+
+        // Cross-frame guard: if A was overwritten later in frame 11 after
+        // B copied from A, and frame 10 was already ended, LAST_WRITERS[A]
+        // is newer than B's copy and must be rejected rather than misattributed.
+        let buf_c = 0x3000_0003usize;
+        let buf_d = 0x3000_0004usize;
+        commit_writes(
+            11,
+            32,
+            0,
+            &[
+                synthetic_write(buf_d, Some(buf_c), WriteKind::CopyResource, None, 0, ""),
+                synthetic_write(buf_c, None, WriteKind::ClearRtv, None, 1, ""),
+            ],
+        );
+        assert_eq!(writer_chain(buf_d, 8).len(), 1);
+        end_frame(11);
+    }
+
+    #[test]
+    fn correlate_present_and_end_frame_clear_current_frame_writes() {
+        let tex_11 = 0x4000_0001usize;
+        let tex_12 = 0x4000_0002usize;
+        commit_writes(
+            11,
+            40,
+            0,
+            &[synthetic_write(tex_11, None, WriteKind::Draw, Some(0), 0, "ui")],
+        );
+        commit_writes(
+            12,
+            41,
+            0,
+            &[synthetic_write(tex_12, None, WriteKind::ClearRtv, None, 0, "")],
+        );
+        correlate_present(
+            11,
+            &[PresentPlane {
+                plane: 0,
+                composition_index: 0,
+                resource: tex_11,
+                width: 64,
+                height: 64,
+                format: 28,
+            }],
+        );
+        end_frame(11);
+        let remaining: Vec<u64> = FRAME_WRITES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|w| w.target == tex_11 || w.target == tex_12)
+            .map(|w| w.frame)
+            .collect();
+        assert_eq!(remaining, vec![12]);
+        end_frame(12);
+    }
+
+    #[test]
+    fn bound_input_provenance_enforces_monotonic_order_and_tags_dropped_cs() {
+        let written_tex = 0x5000_0001usize;
+        let unwritten_buf = 0x5000_0010usize;
+        let future_tex = 0x5000_0020usize;
+        let out_rtv = 0x5000_0030usize;
+
+        record_dropped_compute("e18931c72af42e46", "compute", "unsupported opcode");
+        record_dropped_dispatch("compute e18931c72af42e46", "compute shader translation failed");
+
+        commit_writes(
+            13,
+            50,
+            0,
+            &[
+                synthetic_write(written_tex, None, WriteKind::Draw, Some(0), 0, "gbuffer"),
+                synthetic_write(out_rtv, None, WriteKind::Draw, Some(0), 1, "lighting"),
+                synthetic_write(future_tex, None, WriteKind::ClearRtv, None, 2, "later"),
+            ],
+        );
+        commit_input_traces(
+            13,
+            50,
+            0,
+            &[InputTrace {
+                pipeline: "lighting".to_owned(),
+                targets: vec![out_rtv],
+                inputs: vec![
+                    BoundInput {
+                        kind: InputKind::Srv,
+                        stage: "pixel",
+                        slot: 0,
+                        resource: written_tex,
+                        is_buffer: false,
+                        size: 0,
+                    },
+                    BoundInput {
+                        kind: InputKind::Cbv,
+                        stage: "pixel",
+                        slot: 1,
+                        resource: unwritten_buf,
+                        is_buffer: true,
+                        size: 256,
+                    },
+                    BoundInput {
+                        kind: InputKind::Srv,
+                        stage: "pixel",
+                        slot: 2,
+                        resource: future_tex,
+                        is_buffer: false,
+                        size: 0,
+                    },
+                ],
+                submission: 0,
+                list_index: 0,
+                op_index: 1,
+                frame: 0,
+            }],
+        );
+
+        let reports = input_reports(13);
+        let report = reports
+            .iter()
+            .find(|r| r.pipeline == "lighting" && r.targets == vec![out_rtv])
+            .expect("lighting input report must be recorded");
+        assert_eq!(report.inputs.len(), 3);
+        assert_eq!(
+            report.inputs[0].writer.as_ref().map(|w| w.kind),
+            Some(WriteKind::Draw)
+        );
+        assert!(report.inputs[1].writer.is_none());
+        assert!(report.inputs[1].status.contains("never host-written"));
+        assert!(
+            report.inputs[1]
+                .status
+                .contains("dropped upstream CS translation")
+        );
+        assert!(report.inputs[1].status.contains("e18931c72af42e46"));
+        assert!(report.inputs[1].status.contains("dropped upstream dispatch"));
+        // Future write at op_index=2 must NOT be attributed to op_index=1.
+        assert!(report.inputs[2].writer.is_none());
+        assert!(report.inputs[2].status.contains("never host-written"));
+        end_frame(13);
     }
 }
