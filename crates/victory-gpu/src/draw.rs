@@ -61,8 +61,8 @@ pub(crate) struct State {
     compute: Vec<Root>,
     vertex: [VertexView; 32],
     index: IndexView,
-    /// Bound render target and depth resources, for their host states.
-    targets: Vec<usize>,
+    /// Bound render targets and their selected host subresources.
+    targets: Vec<(usize, u32)>,
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
@@ -264,10 +264,14 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
-            self.targets.push(record.resource as usize);
+            let desc = record.desc();
+            self.targets.push((
+                record.resource as usize,
+                crate::descriptor::rtv_subresource(texture, desc.as_ref()),
+            ));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -389,8 +393,8 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        for &(resource, subresource) in &self.targets {
+            crate::list::ensure_subresource_state(list, resource as This, subresource, RENDER_TARGET);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
@@ -747,7 +751,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
+            .filter_map(|&(resource, _)| crate::resource::host_resource(resource as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -1088,15 +1092,26 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         }
     }
     match (view, u.kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
-            if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
-            {
-                crate::texture::upload(list, *resource as This, t);
+        (View::Shader(resource, desc), ResourceType::Srv) => {
+            let this = *resource as This;
+            let Some(t) = crate::resource::host_resource(this) else {
+                return;
+            };
+            if crate::texture::title_written(t) {
+                crate::texture::upload(list, this, t);
             }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            if let Some(mips) = desc
+                .as_ref()
+                .and_then(|desc| crate::descriptor::host::srv_mips(t, desc))
+            {
+                for mip in mips {
+                    crate::list::ensure_subresource_state(list, this, mip, SHADER_RESOURCE);
+                }
+            } else {
+                crate::list::ensure_state(list, this, SHADER_RESOURCE);
+            }
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {

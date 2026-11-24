@@ -234,6 +234,48 @@ impl RtvRecord {
     }
 }
 
+/// Mip indices also identify subresources on plane zero of these color targets.
+#[cfg(windows)]
+fn color_mip_count(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> Option<u32> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    };
+    // SAFETY: the host texture is live.
+    let desc = unsafe { texture.GetDesc() };
+    (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.MipLevels > 1
+        && desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+    .then_some(u32::from(desc.MipLevels))
+}
+
+/// The host subresource selected by a 2D color render-target view.
+#[cfg(windows)]
+pub(crate) fn rtv_subresource(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    desc: Option<&windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC>,
+) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES as ALL, D3D12_RTV_DIMENSION_TEXTURE2D,
+    };
+    let Some(count) = color_mip_count(texture) else {
+        return ALL;
+    };
+    match desc {
+        None => 0,
+        Some(desc) if desc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the view dimension selects this union member.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            if view.PlaneSlice == 0 && view.MipSlice < count {
+                view.MipSlice
+            } else {
+                ALL
+            }
+        }
+        Some(_) => ALL,
+    }
+}
+
 /// Device method: records the view at `handle` (descriptor memory).
 pub(crate) extern "system" fn create_rtv(
     _: This,

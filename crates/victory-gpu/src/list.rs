@@ -717,8 +717,10 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        ensure_state(list, record.resource, RENDER_TARGET);
-        let rtv = host.rtv(texture, record.desc().as_ref());
+        let desc = record.desc();
+        let subresource = crate::descriptor::rtv_subresource(texture, desc.as_ref());
+        ensure_subresource_state(list, record.resource, subresource, RENDER_TARGET);
+        let rtv = host.rtv(texture, desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list.ClearRenderTargetView(rtv, color, rects);
