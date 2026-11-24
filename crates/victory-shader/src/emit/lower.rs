@@ -3786,11 +3786,8 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cvt_f32_f64" => {
-                let a = self.src64(inst, 0)?;
-                let dbl_t = self.s.m.double();
-                self.s.flags |= flags::DOUBLES;
-                let a_dbl = self.s.m.cast(c, Cast::Bitcast, a, dbl_t);
-                let r = self.s.m.cast(c, Cast::FPTrunc, a_dbl, self.s.t.f32);
+                let a = self.double_src(inst)?;
+                let r = self.s.m.cast(c, Cast::FPTrunc, a, self.s.t.f32);
                 float(self, r)
             }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
@@ -4020,6 +4017,69 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Decode the source of a double-to-float conversion by its FP64 layout.
+    fn double_src(&mut self, inst: &Inst) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.first().ok_or("a missing operand")?;
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => self.read_pair(inst, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                self.read_pair(inst, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(code @ 240..=248) => {
+                let constants = [
+                    0.5,
+                    -0.5,
+                    1.0,
+                    -1.0,
+                    2.0,
+                    -2.0,
+                    4.0,
+                    -4.0,
+                    f64::from_bits(0x3fc4_5f30_6dc9_c882), // AMD's inline 1/(2π)
+                ];
+                let bits = constants[usize::from(code - 240)].to_bits();
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            // A floating double literal occupies the high dword.
+            Operand::Literal(bits) => (self.s.m.i32(0), self.s.m.i32(bits)),
+            _ => {
+                let lo = self.operand(inst, &op)?;
+                let hi = if matches!(op, Operand::Const(193..=208)) {
+                    u32::MAX
+                } else {
+                    0
+                };
+                (lo, self.s.m.i32(hi))
+            }
+        };
+        let block = self.cur;
+        if v.abs & 1 != 0 {
+            let mask = self.s.m.i32(0x7fff_ffff);
+            hi = self.s.m.bin(block, Bin::And, hi, mask);
+        }
+        if v.neg & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(block, Bin::Xor, hi, sign);
+        }
+        self.s.flags |= flags::DOUBLES;
+        let ty = self.s.m.double();
+        Ok(self
+            .s
+            .op(block, "makeDouble.f64", Attr::ReadNone, ty, 101, &[lo, hi]))
+    }
+
+    fn read_pair(&mut self, inst: &Inst, lo: Reg, hi: Reg) -> Result<(V, V), Why> {
+        let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+        let hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+        Ok((lo, hi))
+    }
+
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -4033,8 +4093,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::INT64;
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let (lo, hi) = l.read_pair(inst, r, r1)?;
             let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
             let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
             let k32 = l.s.m.int_const(i64t, 32);
