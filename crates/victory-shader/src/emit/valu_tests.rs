@@ -937,3 +937,380 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// SMEM `s_load_dwordx4` (`count_code` 2) or `s_load_dwordx8` (`count_code` 3).
+const fn smem_load(count_code: u8, dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (count_code as u32) << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// VOP2 `op vdst, src0, vsrc1`.
+const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    ((op as u32 & 0x3F) << 25) | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// MIMG 2D (`dim` 1) instruction.
+const fn mimg_2d(op: u8, vdata: u8, vaddr: u8, srsrc: u8, dmask: u8, glc: bool) -> [u32; 2] {
+    [
+        0x3C << 26 | (op as u32) << 18 | (glc as u32) << 13 | (dmask as u32) << 8 | 1 << 3,
+        (vaddr as u32) | (vdata as u32) << 8 | ((srsrc as u32 >> 2) & 0x1F) << 16,
+    ]
+}
+
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen offset:byte_off`.
+const fn buffer_store_dword_offen(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | (vaddr as u32),
+    ]
+}
+
+#[test]
+fn image_atomic_64_bit_executes_across_threads_and_glc_modes() {
+    // 32-thread compute shader (`v0` = lane 0..31), UAV table at user SGPR s0:
+    //   heap index 0 (`s[4:11]`): 6x1 `R32G32_UINT` 2D texture UAV (64-bit atomics)
+    //   heap index 1 (`s[12:15]`): 256-dword raw buffer UAV (per-lane outputs)
+    //
+    // Covers:
+    // 1. `glc = false` `image_atomic_add` on texel (0, 0): sums `(1 << 32) | (i + 1)`
+    //    across 32 lanes AND verifies `v[2:3]` is not clobbered when `glc` is clear.
+    // 2. `glc = true` `image_atomic_add` on texel (1, 0): sums `(1 << 31) + i` across
+    //    the 32-bit carry boundary and verifies all 32 returned old values are unique.
+    // 3. `glc = false` `image_atomic_umax` on texel (2, 0): 64-bit unsigned max above 2^32.
+    // 4. `glc = true` `image_atomic_cmpswap` (`dmask = 0xF`) on zeroed texel (3, 0):
+    //    32 lanes race to replace `0` with `(0xDEAD_BEEF << 32) | (0xCAFE_0000 + i)`;
+    //    exactly one lane wins (old == 0) and 31 lanes read the winner's 64-bit value,
+    //    while `v[10:11]` (`cmp`) stays intact.
+    // 5. Divergent lane-guarded (`v0 < 16`) `glc = true` `image_atomic_sub` on texel (4, 0)
+    //    and signed `image_atomic_smin` on texel (5, 0).
+    let mut words = Vec::new();
+    words.push(s_mov_b32(2, 0)); // s2 = table base (s0), s3 = 0
+    words.push(s_mov_b32(3, 0x80));
+    words.extend_from_slice(&smem_load(0x03, 4, 2, 0)); // s[4:11] = 64-bit texture UAV
+    words.extend_from_slice(&smem_load(0x02, 12, 2, 32)); // s[12:15] = raw UAV
+    // v1 = byte offset `v0 * 40` (10 dwords per lane in raw UAV).
+    words.extend_from_slice(&vop3(0x169, 1, vgpr(0), 128 + 40, 0)); // v_mul_lo_u32 v1, v0, 40
+
+    // 1) Texel (0, 0): glc=false `image_atomic_add` (`0x11`), v[2:3] = (v0 + 1, 1).
+    words.push(vop2(0x25, 2, 128 + 1, 0)); // v_add_nc_u32 v2, 1, v0
+    words.push(vop1(0x01, 3, 128 + 1)); // v_mov_b32 v3, 1
+    words.push(vop1(0x01, 4, 128)); // v4 = x = 0
+    words.push(vop1(0x01, 5, 128)); // v5 = y = 0
+    words.extend_from_slice(&mimg_2d(0x11, 2, 4, 4, 0x3, false));
+    // Store v2, v3 after the glc=false atomic: must still equal (v0 + 1, 1).
+    words.extend_from_slice(&buffer_store_dword_offen(2, 1, 12, 0));
+    words.extend_from_slice(&buffer_store_dword_offen(3, 1, 12, 4));
+
+    // 2) Texel (1, 0): glc=true `image_atomic_add` (`0x11`), v[6:7] = (0x8000_0000 + v0, 0).
+    words.push(vop2(0x25, 6, 255, 0)); // v_add_nc_u32 v6, 0x8000_0000, v0
+    words.push(0x8000_0000);
+    words.push(vop1(0x01, 7, 128)); // v7 = 0
+    words.push(vop1(0x01, 4, 128 + 1)); // v4 = x = 1
+    words.extend_from_slice(&mimg_2d(0x11, 6, 4, 4, 0x3, true));
+    words.extend_from_slice(&buffer_store_dword_offen(6, 1, 12, 8));
+    words.extend_from_slice(&buffer_store_dword_offen(7, 1, 12, 12));
+
+    // 3) Texel (2, 0): glc=false `image_atomic_umax` (`0x17`), value = ((v0 + 3) << 32) | (100 + v0).
+    words.push(vop2(0x25, 6, 255, 0));
+    words.push(100);
+    words.push(vop2(0x25, 7, 128 + 3, 0)); // v7 = v0 + 3
+    words.push(vop1(0x01, 4, 128 + 2)); // v4 = x = 2
+    words.extend_from_slice(&mimg_2d(0x17, 6, 4, 4, 0x3, false));
+
+    // 4) Texel (3, 0): glc=true `image_atomic_cmpswap` (`0x10`, dmask 0xF):
+    //    v[8:9] = new = (0xCAFE_0000 + v0, 0xDEAD_BEEF), v[10:11] = cmp = (0, 0).
+    words.push(vop2(0x25, 8, 255, 0));
+    words.push(0xCAFE_0000);
+    words.push(vop1(0x01, 9, 255));
+    words.push(0xDEAD_BEEF);
+    words.push(vop1(0x01, 10, 128));
+    words.push(vop1(0x01, 11, 128));
+    words.push(vop1(0x01, 4, 128 + 3)); // v4 = x = 3
+    words.extend_from_slice(&mimg_2d(0x10, 8, 4, 4, 0xF, true));
+    words.extend_from_slice(&buffer_store_dword_offen(8, 1, 12, 16));
+    words.extend_from_slice(&buffer_store_dword_offen(9, 1, 12, 20));
+
+    // 5) Texel (4, 0): divergent guard `v0 < 16` -> glc=true `image_atomic_sub` (`0x12`),
+    //    and signed `image_atomic_smin` (`0x14`) on texel (5, 0) with negative 64-bit value.
+    //    Initialize v[12:13] = (0x1000 + v0, 2) before the guard so inactive lanes (16..31)
+    //    must preserve (0x1000 + v0, 2).
+    words.push(vop2(0x25, 12, 255, 0));
+    words.push(0x1000);
+    words.push(vop1(0x01, 13, 128 + 2));
+    words.push(vop1(0x01, 4, 128 + 4)); // v4 = x = 4
+    // v_cmp_gt_u32_e32 vcc_lo, 16, v0 (true when 16 > v0, i.e., v0 < 16; VOPC 0x0c4)
+    words.push(0x7D88_0090);
+    words.push(0xBE90_3C6A); // s_and_saveexec_b32 s16, vcc_lo
+    words.extend_from_slice(&mimg_2d(0x12, 12, 4, 4, 0x3, true));
+    // Signed smin on texel (5, 0): active lanes 0..15 write -(i64(v0 + 1) << 32) = (0, -(v0 + 1)).
+    words.push(vop1(0x01, 14, 128)); // v14 = 0
+    words.push(vop2(0x26, 15, 193, 0)); // v_sub_nc_u32 v15, -1, v0  (-1 - v0 = -(v0 + 1))
+    words.push(vop1(0x01, 4, 128 + 5)); // v4 = x = 5
+    words.extend_from_slice(&mimg_2d(0x14, 14, 4, 4, 0x3, false));
+    words.push(0xBEFE_0310); // s_mov_b32 exec_lo, s16
+    words.extend_from_slice(&buffer_store_dword_offen(12, 1, 12, 24));
+    words.extend_from_slice(&buffer_store_dword_offen(13, 1, 12, 28));
+
+    // 6) Texel (6, 0): `image_atomic_or` (`0x19`), each lane sets bit `v0` in
+    //    both low and high dwords -> full 64-bit `u64::MAX`.
+    words.extend_from_slice(&vop3(0x11a, 14, vgpr(0), 128 + 1, 0)); // v_lshlrev_b32 v14, v0, 1
+    words.push(vop1(0x01, 15, vgpr(14)));
+    words.push(vop1(0x01, 4, 128 + 6)); // v4 = x = 6
+    words.extend_from_slice(&mimg_2d(0x19, 14, 4, 4, 0x3, false));
+
+    // 7) Texel (7, 0): `image_atomic_xor` (`0x1a`), low = `1 << v0`, high = `(v0 & 1) << v0`
+    //    -> `(0xAAAA_AAAA << 32) | 0xFFFF_FFFF`.
+    words.push(vop2(0x1b, 15, 128 + 1, 0)); // v_and_b32 v15, 1, v0
+    words.extend_from_slice(&vop3(0x11a, 15, vgpr(0), vgpr(15), 0)); // v_lshlrev_b32 v15, v0, v15
+    words.push(vop1(0x01, 4, 128 + 7)); // v4 = x = 7
+    words.extend_from_slice(&mimg_2d(0x1a, 14, 4, 4, 0x3, false));
+
+    // 8) Texel (8, 0): signed `image_atomic_smax` (`0x16`) with `(i32(v0) - 20) << 32`:
+    //    negative lanes (`0..20`) have high bits set (`0xFFFF_FFFF`), so unsigned max
+    //    would pick `-1 << 32`; signed `smax` must pick `11 << 32` (lane 31).
+    words.push(vop1(0x01, 14, 128)); // v14 = 0
+    words.push(vop2(0x27, 15, 128 + 20, 0)); // v_subrev_nc_u32 v15, 20, v0  (v0 - 20)
+    words.push(vop1(0x01, 4, 128 + 8)); // v4 = x = 8
+    words.extend_from_slice(&mimg_2d(0x16, 14, 4, 4, 0x3, false));
+
+    // 9) Texel (9, 0): `image_atomic_swap` (`0x0f`, glc=true), each lane swaps in
+    //    `(0x5500_0000 << 32) | (v0 + 1)` and stores the returned 64-bit old value.
+    words.push(vop2(0x25, 14, 128 + 1, 0)); // v14 = v0 + 1
+    words.push(vop1(0x01, 15, 255));
+    words.push(0x5500_0000);
+    words.push(vop1(0x01, 4, 128 + 9)); // v4 = x = 9
+    words.extend_from_slice(&mimg_2d(0x0f, 14, 4, 4, 0x3, true));
+    words.extend_from_slice(&buffer_store_dword_offen(14, 1, 12, 32));
+    words.extend_from_slice(&buffer_store_dword_offen(15, 1, 12, 36));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 20,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1, // 1 user SGPR (s0), v0 = thread_id_x
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let adapters = Host::adapters();
+    assert!(
+        !adapters.is_empty(),
+        "no SM 6.6 hardware or WARP device available"
+    );
+    let mut ran_supported = 0;
+    for (label, host) in &adapters {
+        let supported = host.supports_typed_int64_atomics();
+        eprintln!("64-bit typed UAV atomics on {label}: supported={supported}");
+        if !supported {
+            continue;
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            assert_eq!(u.root, RootType::Table);
+            ud[u.index as usize] = 0;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::Uint64TextureUav(10, 1), View::RawUav(320)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+
+        let tex = &out[0];
+        let raw = &out[1];
+        let u64_at = |words: &[u32], idx: usize| -> u64 {
+            u64::from(words[2 * idx]) | (u64::from(words[2 * idx + 1]) << 32)
+        };
+
+        // 1) Texel (0, 0): sum_{i=0..31} ((1 << 32) | (i + 1)) = (32 << 32) + 528.
+        assert_eq!(
+            u64_at(tex, 0),
+            (32u64 << 32) + 528,
+            "{label}: glc=false add total"
+        );
+        for i in 0..32usize {
+            assert_eq!(
+                (raw[10 * i], raw[10 * i + 1]),
+                (i as u32 + 1, 1),
+                "{label}: glc=false clobbered VGPR pair on lane {i}"
+            );
+        }
+
+        // 2) Texel (1, 0): sum_{i=0..31} ((1 << 31) + i) = 0x10_0000_01F0.
+        let want_carry_sum = 32u64 * 0x8000_0000 + 31 * 32 / 2;
+        assert_eq!(
+            u64_at(tex, 1),
+            want_carry_sum,
+            "{label}: glc=true carry add total"
+        );
+        let mut olds: Vec<u64> = (0..32)
+            .map(|i| u64::from(raw[10 * i + 2]) | (u64::from(raw[10 * i + 3]) << 32))
+            .collect();
+        olds.sort_unstable();
+        olds.dedup();
+        assert_eq!(
+            olds.len(),
+            32,
+            "{label}: glc=true old values must be unique"
+        );
+        assert_eq!(olds[0], 0, "{label}: first old value must be 0");
+
+        // 3) Texel (2, 0): max_{i=0..31} (((i + 3) << 32) | (100 + i)) at i = 31 -> (34 << 32) | 131.
+        assert_eq!(u64_at(tex, 2), (34u64 << 32) | 131, "{label}: 64-bit umax");
+
+        // 4) Texel (3, 0): 32-lane cmpswap from 0 -> winner writes (0xDEAD_BEEF << 32) | (0xCAFE_0000 + w).
+        let final_cas = u64_at(tex, 3);
+        let winner_lane = (final_cas & 0xFFFF) as u32;
+        assert!(winner_lane < 32, "{label}: invalid winner {final_cas:#x}");
+        assert_eq!(
+            final_cas,
+            (0xDEAD_BEEFu64 << 32) | u64::from(0xCAFE_0000 + winner_lane),
+            "{label}: cmpswap final texel"
+        );
+        let cas_olds: Vec<u64> = (0..32)
+            .map(|i| u64::from(raw[10 * i + 4]) | (u64::from(raw[10 * i + 5]) << 32))
+            .collect();
+        let zeros = cas_olds.iter().filter(|&&v| v == 0).count();
+        let losers = cas_olds.iter().filter(|&&v| v == final_cas).count();
+        assert_eq!(
+            (zeros, losers),
+            (1, 31),
+            "{label}: cmpswap old values: {cas_olds:?}"
+        );
+
+        // 5) Texel (4, 0): lanes 0..16 each subtracted `(2 << 32) | (0x1000 + i)` from 0;
+        //    lanes 16..32 were masked off and must keep `(0x1000 + i, 2)`.
+        let sub_sum: u64 = (0..16u64).map(|i| (2u64 << 32) | (0x1000 + i)).sum();
+        assert_eq!(
+            u64_at(tex, 4),
+            0u64.wrapping_sub(sub_sum),
+            "{label}: guarded 64-bit sub total"
+        );
+        for i in 16..32usize {
+            assert_eq!(
+                (raw[10 * i + 6], raw[10 * i + 7]),
+                (0x1000 + i as u32, 2),
+                "{label}: inactive lane {i} did not preserve VGPR pair"
+            );
+        }
+
+        // Texel (5, 0): signed smin over `-(i + 1) << 32` for i in 0..16 -> `-16 << 32`.
+        assert_eq!(
+            u64_at(tex, 5) as i64,
+            -(16i64 << 32),
+            "{label}: signed 64-bit smin"
+        );
+
+        // 6) Texel (6, 0): 64-bit bitwise `or` across all 32 lanes -> `u64::MAX`.
+        assert_eq!(u64_at(tex, 6), u64::MAX, "{label}: 64-bit or");
+
+        // 7) Texel (7, 0): 64-bit bitwise `xor` -> `0xAAAA_AAAA_FFFF_FFFF`.
+        assert_eq!(u64_at(tex, 7), 0xAAAA_AAAA_FFFF_FFFF, "{label}: 64-bit xor");
+
+        // 8) Texel (8, 0): signed `smax` over `(-20..=11) << 32` -> `11 << 32`.
+        assert_eq!(
+            u64_at(tex, 8) as i64,
+            11i64 << 32,
+            "{label}: signed 64-bit smax"
+        );
+
+        // 9) Texel (9, 0): 32-lane `swap` (`glc = true`) -> `{32 old values} U {final}`
+        //    equals `{0} U {(0x5500_0000 << 32) | (i + 1) : i in 0..32}`.
+        let mut swap_seen: Vec<u64> = (0..32)
+            .map(|i| u64::from(raw[10 * i + 8]) | (u64::from(raw[10 * i + 9]) << 32))
+            .collect();
+        swap_seen.push(u64_at(tex, 9));
+        swap_seen.sort_unstable();
+        let mut swap_want = vec![0u64];
+        swap_want.extend((0..32u64).map(|i| (0x5500_0000u64 << 32) | (i + 1)));
+        swap_want.sort_unstable();
+        assert_eq!(swap_seen, swap_want, "{label}: 64-bit swap conservation");
+
+        ran_supported += 1;
+    }
+    assert!(
+        ran_supported > 0,
+        "no adapter supported 64-bit typed UAV atomics"
+    );
+}

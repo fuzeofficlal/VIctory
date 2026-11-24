@@ -78,6 +78,13 @@ impl Host {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
+            Self::check_sm66(device)
+        }
+    }
+
+    fn check_sm66(device: ID3D12Device) -> Result<Self, String> {
+        // SAFETY: `sm` is a valid feature-query struct for `device`.
+        unsafe {
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -95,6 +102,86 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// Every SM 6.6 hardware adapter and WARP, with its name.
+    #[cfg(test)]
+    pub fn adapters() -> Vec<(String, Self)> {
+        let mut out = Vec::new();
+        if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+            if let Ok(h) = Self::new(true) {
+                out.push(("WARP".into(), h));
+            }
+            return out;
+        }
+        // SAFETY: plain DXGI/D3D12 enumeration with valid out pointers.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return out;
+            };
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..len]);
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device
+                    && let Ok(host) = Self::check_sm66(dev)
+                {
+                    out.push((name, host));
+                }
+            }
+            if let Ok(warp_adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() {
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&warp_adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device
+                    && let Ok(host) = Self::check_sm66(dev)
+                {
+                    out.push(("WARP".into(), host));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the device supports 64-bit integer atomics on typed UAVs in
+    /// descriptor heaps (`D3D12_OPTIONS9` and `D3D12_OPTIONS11`).
+    #[cfg(test)]
+    pub fn supports_typed_int64_atomics(&self) -> bool {
+        // SAFETY: plain D3D12 feature queries with valid structs.
+        unsafe {
+            let mut opt9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+            let mut opt11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS9,
+                    (&raw mut opt9).cast(),
+                    size_of_val(&opt9) as u32,
+                )
+                .is_ok()
+                && opt9.AtomicInt64OnTypedResourceSupported.as_bool()
+                && self
+                    .device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS11,
+                        (&raw mut opt11).cast(),
+                        size_of_val(&opt11) as u32,
+                    )
+                    .is_ok()
+                && opt11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
         }
     }
 
@@ -918,6 +1005,8 @@ pub enum View<'a> {
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
+    Uint64TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1018,7 +1107,7 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
+            // Texel words: 4 for RGBA32F, 2 for R32G32_UINT, 1 for R32_UINT.
             let footprint_as =
                 |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1027,10 +1116,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                                Format: match words {
+                                    1 => DXGI_FORMAT_R32_UINT,
+                                    2 => DXGI_FORMAT_R32G32_UINT,
+                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 },
                                 Width: w,
                                 Height: h,
@@ -1206,25 +1295,25 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) => {
+                    View::UintTextureUav(w, h) | View::Uint64TextureUav(w, h) => {
+                        let (format, words) = if matches!(*v, View::Uint64TextureUav(..)) {
+                            (DXGI_FORMAT_R32G32_UINT, 2)
+                        } else {
+                            (DXGI_FORMAT_R32_UINT, 1)
+                        };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(
-                                w,
-                                h,
-                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                DXGI_FORMAT_R32_UINT,
-                            ),
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        let pitch = (w * 4).next_multiple_of(256);
+                        let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), 1, rb));
+                        uavs.push((t, Some((w, h)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;
