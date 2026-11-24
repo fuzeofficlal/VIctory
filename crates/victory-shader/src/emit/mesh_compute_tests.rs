@@ -631,6 +631,9 @@ fn run_compute(
 
 #[test]
 fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (cs, layout) = lowered(true);
     let groups = 2;
     let mut ran = 0;
@@ -666,6 +669,9 @@ fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
 
 #[test]
 fn mesh_compute_initializes_more_primitive_slots_than_lanes() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (cs, layout) = lowered_with_max_primitives(true, false, 4);
     let host = Host::new(false)
         .or_else(|_| Host::new(true))
@@ -691,19 +697,6 @@ enum Draw<'a> {
         layout: &'a MeshLayout,
         expanded: bool,
     },
-}
-
-fn has_mesh_shaders(host: &Host) -> bool {
-    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-    // SAFETY: a feature query with a matching out structure.
-    let ok = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS7,
-            (&raw mut options).cast(),
-            size_of_val(&options) as u32,
-        )
-    };
-    ok.is_ok() && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
 }
 
 /// Draws `groups` groups of the program with `ps` into a [`SIZE`]² RGBA32F
@@ -877,11 +870,17 @@ fn same_image(a: &[[f32; 4]], b: &[[f32; 4]], tolerance: f32) -> Result<(), Stri
 
 #[test]
 fn a_mesh_program_run_as_compute_draws_what_the_mesh_shader_draws() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     compare_with_the_mesh_shader(false);
 }
 
 #[test]
 fn per_primitive_outputs_run_as_compute_draw_what_the_mesh_shader_draws() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     compare_with_the_mesh_shader(true);
 }
 
@@ -907,7 +906,7 @@ fn compare_with_the_mesh_shader(prims: bool) {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        if has_mesh_shaders(&host) && reference.is_none() {
+        if host.supports_mesh_shaders() && reference.is_none() {
             let native = render(&host, &Draw::Mesh(&ms), &ps, groups)
                 .unwrap_or_else(|e| panic!("{label} mesh: {e}"));
             reference = Some((label, native));
@@ -1056,7 +1055,7 @@ fn wave64_128_thread_mesh_compute_fallback_matches_mesh_shader() {
 
     for (desc, warp, host) in &hosts {
         let lanes = host.wave_lanes();
-        let mesh_ok = has_mesh_shaders(host);
+        let mesh_ok = host.supports_mesh_shaders();
         let rec = host.recommended_wave64_mode();
         eprintln!(
             "[mesh_compute_tests] adapter={desc:?} warp={warp} wave_lanes={lanes:?} mesh={mesh_ok} rec={rec:?}"
@@ -1112,6 +1111,193 @@ fn wave64_128_thread_mesh_compute_fallback_matches_mesh_shader() {
                         &[32, 33, 34],
                         "{desc} ({mode:?}, warp={warp}) prim {p}"
                     );
+                } else if host_wave <= 32 {
+                    assert_eq!(tri, &[0, 0, 0], "{desc} ({mode:?}, warp={warp}) prim {p}");
+                }
+            }
+
+            // 2. Render via Fallback and compare pixel-for-pixel with DispatchMesh.
+            let fallback_pixels = render(
+                host,
+                &Draw::Fallback {
+                    cs: &cs,
+                    vs: &vs,
+                    layout: &layout,
+                    expanded: false,
+                },
+                &ps,
+                1,
+            )
+            .unwrap_or_else(|e| panic!("{desc} ({mode:?}, warp={warp}) fallback render: {e}"));
+            for px in &fallback_pixels {
+                assert_eq!(px[0], 0.0, "{desc} ({mode:?}, warp={warp}) fallback R");
+                assert_ne!(px[1], -1.0, "{desc} ({mode:?}, warp={warp}) uncovered");
+                assert_eq!(px[3], 1.0, "{desc} ({mode:?}, warp={warp}) fallback A");
+            }
+            if mesh_ok {
+                let mesh_pixels = render(host, &Draw::Mesh(&ms), &ps, 1)
+                    .unwrap_or_else(|e| panic!("{desc} ({mode:?}, warp={warp}) mesh render: {e}"));
+                same_image(&mesh_pixels, &fallback_pixels, 1e-6)
+                    .unwrap_or_else(|e| panic!("{desc} ({mode:?}, warp={warp}) parity: {e}"));
+            }
+        }
+    }
+}
+
+/// 32-thread Wave32 mesh shader (`v_mbcnt_lo(-1, 0)` + `v_readfirstlane` +
+/// fullscreen triangle from threads 4..6).
+fn wave32_host_lane_parity_program() -> NativeProgram {
+    const TWO: u16 = 0x82;
+    const VCC: u16 = 106;
+    let mut w = Vec::new();
+    w.extend(vop3(0x365, 0, MINUS_ONE, ZERO, 0)); // v_mbcnt_lo_u32_b32 v0, -1, 0
+    w.push(vop1(0x002, 4, vgpr(0))); // v_readfirstlane_b32 s4, v0
+    w.push(vop2(0x1B, 5, 0x80 + 3, 0)); // v_and_b32 v5, 3, v0
+    w.push(vop2(0x26, 10, vgpr(0), 5)); // v_sub_nc_u32 v10, v0, v5
+    w.push(vop1(0x006, 1, 4)); // v_cvt_f32_u32 v1, s4
+    w.push(vop1(0x006, 2, vgpr(10))); // v_cvt_f32_u32 v2, v10
+    w.push(vop1(0x006, 3, vgpr(5))); // v_cvt_f32_u32 v3, v5
+    w.push(vop1(0x001, 4, ONE_F)); // v_mov_b32 v4, 1.0
+    w.extend([vop1(0x001, 6, LITERAL), (-1.0f32).to_bits()]);
+    w.extend([vop1(0x001, 7, LITERAL), 3.0f32.to_bits()]);
+    w.push(vopc(0xC2, ONE, 5)); // v_cmp_eq_u32 1, v5
+    w.extend(vop3(0x101, 6, vgpr(6), vgpr(7), VCC));
+    w.extend([vop1(0x001, 11, LITERAL), (-1.0f32).to_bits()]);
+    w.push(vopc(0xC2, TWO, 5)); // v_cmp_eq_u32 2, v5
+    w.extend(vop3(0x101, 7, vgpr(11), vgpr(7), VCC));
+    w.extend([vop1(0x001, 8, LITERAL), 0.5f32.to_bits()]);
+    w.push(vop1(0x001, 9, ONE_F));
+    w.extend(exp(32, [Some(1), Some(2), Some(3), Some(4)], false)); // TEXCOORD0
+    w.extend(exp(12, [Some(6), Some(7), Some(8), Some(9)], false)); // SV_Position
+    w.extend([vop1(0x001, 14, LITERAL), 0x8000_0000]);
+    w.extend([vop1(0x001, 15, LITERAL), 4 | (5 << 10) | (6 << 20)]);
+    w.push(vopc(0xC2, ZERO, 0)); // v_cmp_eq_u32 0, v0
+    w.extend(vop3(0x101, 13, vgpr(14), vgpr(15), VCC));
+    w.extend(exp(20, [Some(13), None, None, None], true)); // prim
+    w.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Ms,
+        wave64: false,
+        vgprs: 16,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 1,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 32,
+            max_primitives: 32,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+fn lower_wave32_mesh(as_compute: bool, mode: Wave64Mode) -> (HostShader, MeshLayout) {
+    let native = wave32_host_lane_parity_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let outs = outputs();
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: outs.clone(),
+        prims: Vec::new(),
+        mesh_stride: 32,
+        options: TranslateOptions { wave64: mode },
+        mesh_as_compute: as_compute,
+    })
+    .expect("lower");
+    let s = shader(HwStage::Ms, l.dxil);
+    validate(&s);
+    let layout = MeshLayout {
+        threads: 32,
+        max_vertices: 32,
+        max_primitives: 32,
+        vertex_dwords: 4 * outs.len() as u32,
+        primitive_dwords: 0,
+    };
+    (s, layout)
+}
+
+#[test]
+fn wave32_32_thread_mesh_compute_fallback_matches_mesh_shader() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let ps = pixel_shader(false);
+    let hosts = Host::all_test_hosts();
+    assert!(!hosts.is_empty(), "expected at least one SM 6.6 host");
+
+    for (desc, warp, host) in &hosts {
+        let lanes = host.wave_lanes();
+        let mesh_ok = host.supports_mesh_shaders();
+        let rec = host.recommended_wave64_mode();
+        let mut modes = vec![rec];
+        if !modes.contains(&Wave64Mode::Emulate) {
+            modes.push(Wave64Mode::Emulate);
+        }
+        if host.supports_wave32() && !modes.contains(&Wave64Mode::Wave32) {
+            modes.push(Wave64Mode::Wave32);
+        }
+
+        for mode in modes {
+            let (ms, _) = lower_wave32_mesh(false, mode);
+            let (cs, layout) = lower_wave32_mesh(true, mode);
+            let vs = fallback_vs(&layout);
+
+            // 1. Verify u0 (vertices) & u1 (indices) UAV readback across all 32 threads.
+            let [vertices, indices] = run_compute(host, &cs, &layout, 1)
+                .unwrap_or_else(|e| panic!("{desc} ({mode:?}, warp={warp}) run_compute: {e}"));
+            assert_eq!(vertices.len(), 32 * 8);
+            assert_eq!(indices.len(), 32 * 3);
+            let host_wave = if lanes.0 && lanes.1 == lanes.2 {
+                lanes.1
+            } else {
+                32
+            };
+            for t in 0..32usize {
+                let r = f32::from_bits(vertices[8 * t + 4]);
+                let g = f32::from_bits(vertices[8 * t + 5]);
+                let b = f32::from_bits(vertices[8 * t + 6]);
+                let a = f32::from_bits(vertices[8 * t + 7]);
+                assert_eq!(
+                    r, 0.0,
+                    "{desc} ({mode:?}, warp={warp}) thread {t}: expected R=0.0, got {r}"
+                );
+                assert_eq!(a, 1.0, "{desc} ({mode:?}, warp={warp}) thread {t}: A");
+                if host_wave <= 32 {
+                    let lane = t as u32 % host_wave;
+                    assert_eq!(
+                        g,
+                        (lane & !3) as f32,
+                        "{desc} ({mode:?}, warp={warp}) thread {t}: G"
+                    );
+                    assert_eq!(
+                        b,
+                        (lane & 3) as f32,
+                        "{desc} ({mode:?}, warp={warp}) thread {t}: B"
+                    );
+                }
+            }
+            for p in 0..32usize {
+                let tri = &indices[3 * p..3 * p + 3];
+                if (p as u32).is_multiple_of(host_wave) {
+                    assert_eq!(tri, &[4, 5, 6], "{desc} ({mode:?}, warp={warp}) prim {p}");
                 } else if host_wave <= 32 {
                     assert_eq!(tri, &[0, 0, 0], "{desc} ({mode:?}, warp={warp}) prim {p}");
                 }

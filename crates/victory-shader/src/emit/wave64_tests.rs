@@ -336,6 +336,68 @@ fn make_ms_host_lane_parity_program() -> NativeProgram {
     }
 }
 
+/// 32-thread Wave32 mesh shader (`wave64 == false`) testing `v_mbcnt_lo(-1, 0)` +
+/// `v_readfirstlane` + fullscreen triangle on threads 4..6.
+fn make_ms_wave32_host_lane_parity_program() -> NativeProgram {
+    let mut code = Vec::new();
+    // 1. v0 = lane_index() via v_mbcnt_lo(-1, 0)
+    code.extend_from_slice(&v_mbcnt_lo_u32_b32(0, NEG_ONE, inline_u(0)));
+    // 2. s4 = waveReadLaneFirst(v0): must be 0 across all 32 threads (including 4..31 on WARP)
+    code.push(v_readfirstlane_b32(4, 0));
+    // 3. v5 = v0 & 3; v10 = v0 - v5 (0 on 4-lane WARP, 4 for threads 4..7 on 32-lane hosts)
+    code.push(v_and_b32(5, inline_u(3), 0));
+    code.push(v_sub_nc_u32(10, vgpr(0), 5));
+    // 4. TEXCOORD0 (v1..v4) = (float(s4), float(v10), float(v5), 1.0)
+    code.push(v_cvt_f32_u32(1, 4));
+    code.push(v_cvt_f32_u32(2, vgpr(10)));
+    code.push(v_cvt_f32_u32(3, vgpr(5)));
+    code.extend_from_slice(&[v_mov_b32(4, LIT), 1.0f32.to_bits()]);
+    // 5. SV_Position (v6..v9): fullscreen triangle for (v5 == 0, 1, 2), i.e. threads 4..6
+    code.extend_from_slice(&[v_mov_b32(6, LIT), (-1.0f32).to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(7, LIT), 3.0f32.to_bits()]);
+    code.push(v_cmp_eq_u32(inline_u(1), 5));
+    code.extend_from_slice(&v_cndmask_b32(6, vgpr(6), vgpr(7), VCC));
+    code.extend_from_slice(&[v_mov_b32(11, LIT), (-1.0f32).to_bits()]);
+    code.push(v_cmp_eq_u32(inline_u(2), 5));
+    code.extend_from_slice(&v_cndmask_b32(7, vgpr(11), vgpr(7), VCC));
+    code.extend_from_slice(&[v_mov_b32(8, LIT), 0.5f32.to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(9, LIT), 1.0f32.to_bits()]);
+    // 6. Export param0 (TEXCOORD0) and pos0 (SV_Position)
+    code.extend_from_slice(&exp(32, [Some(1), Some(2), Some(3), Some(4)], false));
+    code.extend_from_slice(&exp(12, [Some(6), Some(7), Some(8), Some(9)], false));
+    // 7. v0 == 0 emits triangle (4, 5, 6); others emit culled
+    code.extend_from_slice(&[v_mov_b32(14, LIT), 0x8000_0000u32]);
+    code.extend_from_slice(&[v_mov_b32(15, LIT), 4 | (5 << 10) | (6 << 20)]);
+    code.push(v_cmp_eq_u32(inline_u(0), 0));
+    code.extend_from_slice(&v_cndmask_b32(13, vgpr(14), vgpr(15), VCC));
+    code.extend_from_slice(&exp(20, [Some(13), None, None, None], true));
+    code.push(S_ENDPGM);
+
+    NativeProgram {
+        stage: HwStage::Ms,
+        wave64: false,
+        vgprs: 16,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 1,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 32,
+            max_primitives: 32,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
 fn emit_ms_fixture(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, ShaderError> {
     let osg1 = super::container::signature(
         &[
@@ -1560,6 +1622,76 @@ mod gpu {
                             assert_eq!(
                                 px[1], 0.0,
                                 "{desc} ({mode:?}, warp={warp}): expected G=0.0 on host-lane wave32, got {px:?}"
+                            );
+                        }
+                    }
+                    ran = true;
+                }
+            }
+            assert!(ran, "expected at least one mesh-capable SM 6.6 host");
+        });
+    }
+
+    #[test]
+    fn gpu_32_thread_wave32_mesh_host_lane_parity() {
+        let prog = make_ms_wave32_host_lane_parity_program();
+        let ps = emit_ps_rgba_passthrough();
+        with_all_hosts(|hosts| {
+            let mut ran = false;
+            for (desc, warp, host) in hosts {
+                let lanes = host.wave_lanes();
+                let mesh_ok = host.supports_mesh_shaders();
+                if !mesh_ok {
+                    continue;
+                }
+                let mut modes = vec![host.recommended_wave64_mode()];
+                if !modes.contains(&Wave64Mode::Emulate) {
+                    modes.push(Wave64Mode::Emulate);
+                }
+                if host.supports_wave32() && !modes.contains(&Wave64Mode::Wave32) {
+                    modes.push(Wave64Mode::Wave32);
+                }
+                for mode in modes {
+                    let ms = emit_ms_fixture(&prog, mode)
+                        .unwrap_or_else(|e| panic!("{desc} ({mode:?}, warp={warp}): {e}"));
+                    if let Ok(mut v) = super::super::validator::Validator::load(
+                        super::super::validator::Validator::default_path().as_deref(),
+                    ) {
+                        v.validate(&mut ms.dxil.clone())
+                            .unwrap_or_else(|e| panic!("{desc} ({mode:?}) validate: {e}"));
+                    }
+                    let (root, pso) = host
+                        .mesh_pipeline(&ms, &ps)
+                        .unwrap_or_else(|e| panic!("{desc} ({mode:?}, warp={warp}) PSO: {e}"));
+                    let pixels = host
+                        .draw(
+                            &root,
+                            &pso,
+                            &crate::emit::host::Draw {
+                                roots: Vec::new(),
+                                textures: &[],
+                                samplers: &[],
+                                vertices: &[],
+                                stride: 0,
+                                size: (8, 8),
+                                mesh_groups: 1,
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{desc} ({mode:?}, warp={warp}) draw: {e}"));
+                    assert_eq!(pixels.len(), 64);
+                    for px in &pixels {
+                        assert_eq!(
+                            px[0], 0.0,
+                            "{desc} ({mode:?}, warp={warp}): expected R=0.0 (first_lane of v0), got {px:?}"
+                        );
+                        assert_eq!(
+                            px[3], 1.0,
+                            "{desc} ({mode:?}, warp={warp}): expected A=1.0, got {px:?}"
+                        );
+                        if lanes.0 && lanes.1 < 32 {
+                            assert_eq!(
+                                px[1], 0.0,
+                                "{desc} ({mode:?}, warp={warp}): expected G=0.0 on narrower host wave, got {px:?}"
                             );
                         }
                     }
