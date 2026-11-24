@@ -849,6 +849,161 @@ extern "system" fn resolve_queries(
     }
 }
 
+/// `SetPredication(buffer, offset, operation)`: skips commands while the
+/// 64-bit value at `offset` satisfies `operation` (0 equal to zero, 1 not
+/// equal); a null buffer turns predication off.
+extern "system" fn set_predication(this: This, buffer: This, offset: u64, operation: u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_PREDICATION_OP_EQUAL_ZERO, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO,
+            D3D12_RESOURCE_STATE_PREDICATION, ID3D12Resource,
+        };
+        let Some(list) = host_list(this) else {
+            return;
+        };
+        if buffer.is_null() {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "predication off".into());
+            // SAFETY: an open list; `None` turns predication off.
+            unsafe {
+                list.list.SetPredication(
+                    None::<&ID3D12Resource>,
+                    0,
+                    D3D12_PREDICATION_OP_EQUAL_ZERO,
+                )
+            };
+            return;
+        }
+        let op = match operation {
+            0 => D3D12_PREDICATION_OP_EQUAL_ZERO,
+            1 => D3D12_PREDICATION_OP_NOT_EQUAL_ZERO,
+            _ => {
+                tracing::warn!(operation, "unknown predication operation");
+                return;
+            }
+        };
+        if !offset.is_multiple_of(8) {
+            tracing::warn!(offset, "unaligned predication offset");
+            return;
+        }
+        let Some(data) = buffer_range(buffer, offset, 8) else {
+            return;
+        };
+        if let Some(host_buffer) = crate::resource::host_resource(buffer) {
+            ensure_state(list, buffer, D3D12_RESOURCE_STATE_PREDICATION.0 as u32);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("predication {buffer:?}+{offset:#x} op {operation}"));
+            // SAFETY: an open list and a live buffer, in range and aligned.
+            unsafe { list.list.SetPredication(host_buffer, offset, op) };
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Some((upload, staging)) = list.upload(host, 8) else {
+            return;
+        };
+        list.defer_fill(staging, data, 8);
+        #[cfg(feature = "diagnostics")]
+        {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { upload.GetGPUVirtualAddress() };
+            list.note_read(
+                || format!("predication {buffer:?}+{offset:#x} op {operation}"),
+                (gpu, 8),
+            );
+        }
+        // SAFETY: an open list and a live 8-byte upload buffer.
+        unsafe { list.list.SetPredication(&upload, 0, op) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer, offset, operation);
+}
+
+#[cfg(windows)]
+fn marker_payload(data: *const u8, size: u32) -> (Option<*const std::ffi::c_void>, u32) {
+    if data.is_null() || size == 0 {
+        (None, 0)
+    } else {
+        (Some(data.cast()), size)
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn marker_note(kind: &str, metadata: u32, data: *const u8, size: u32) -> String {
+    if data.is_null() || size == 0 {
+        return format!("{kind} ({metadata})");
+    }
+    // SAFETY: non-null with `size` bytes from the caller.
+    let bytes = unsafe { std::slice::from_raw_parts(data, size as usize) };
+    let text: String = if metadata == 0 && bytes.len() >= 2 {
+        char::decode_utf16(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
+                .take_while(|&u| u != 0),
+        )
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .take(120)
+        .collect()
+    } else if metadata == 1 {
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end])
+            .chars()
+            .take(120)
+            .collect()
+    } else {
+        return format!("{kind} ({metadata}, {size} bytes)");
+    };
+    format!("{kind}: {text}")
+}
+
+extern "system" fn set_marker(this: This, metadata: u32, data: *const u8, size: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        let (payload, len) = marker_payload(data, size);
+        #[cfg(feature = "diagnostics")]
+        if crate::host::dred_on() {
+            // `note_op` records the host `SetMarker` paired with `HostList::notes`.
+            list.note_op(|| marker_note("marker", metadata, data, len));
+            return;
+        }
+        // SAFETY: an open list; `(None, 0)` or `len` bytes from the title.
+        unsafe { list.list.SetMarker(metadata, payload, len) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, metadata, data, size);
+}
+
+extern "system" fn begin_event(this: This, metadata: u32, data: *const u8, size: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        let (payload, len) = marker_payload(data, size);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| marker_note("begin event", metadata, data, len));
+        // SAFETY: an open list; `(None, 0)` or `len` bytes from the title.
+        unsafe { list.list.BeginEvent(metadata, payload, len) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, metadata, data, size);
+}
+
+extern "system" fn end_event(this: This) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| "end event".into());
+        // SAFETY: an open list.
+        unsafe { list.list.EndEvent() };
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
 /// IUnknown 3, object 4, device child 1, allocator 2.
 static ALLOCATOR_FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<ALLOCATOR, 24>());
@@ -1339,10 +1494,14 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 13] = [
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
+    (31, set_predication as *const ()),        // 0xf8
+    (56, set_marker as *const ()),             // 0x1c0
+    (57, begin_event as *const ()),            // 0x1c8
+    (58, end_event as *const ()),              // 0x1d0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
@@ -1445,5 +1604,389 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn predication_and_marker_slots_stay_in_place() {
+        for table in [&LIST_FUNCTIONS.0, &NEWER_LIST_FUNCTIONS.0] {
+            assert_eq!(table[31], set_predication as *const ()); // 0xf8
+            assert_eq!(table[56], set_marker as *const ()); // 0x1c0
+            assert_eq!(table[57], begin_event as *const ()); // 0x1c8
+            assert_eq!(table[58], end_event as *const ()); // 0x1d0
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        type Marker = extern "system" fn(This, u32, *const u8, u32);
+        type End = extern "system" fn(This);
+        let mark = slot::<Marker>(list, 0x1c0);
+        let begin = slot::<Marker>(list, 0x1c8);
+        let end = slot::<End>(list, 0x1d0);
+
+        // Null pointers, zero lengths, UTF-16, and arbitrary non-UTF-8 bytes.
+        mark(list, 0, null.cast(), 0);
+        mark(list, 1, null.cast(), 16);
+        let raw = [0xffu8, 0xfe, 0x80, 0x00, 0x41];
+        mark(list, 1, raw.as_ptr(), 0);
+        mark(list, 1, raw.as_ptr(), raw.len() as u32);
+        mark(list, 2, raw.as_ptr(), raw.len() as u32);
+        let utf16: [u16; 4] = [b'o' as u16, b'k' as u16, 0xd800, 0];
+        begin(list, 0, utf16.as_ptr().cast(), size_of_val(&utf16) as u32);
+        end(list);
+        begin(list, 1, null.cast(), 8);
+        end(list);
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_predication_and_events_execute_on_gpu() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Desc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Footprint {
+            offset: u64,
+            format: u32,
+            width: u32,
+            height: u32,
+            depth: u32,
+            row_pitch: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: Footprint,
+        }
+        const _: () = assert!(size_of::<Desc>() == size_of::<crate::resource::ResourceDesc>());
+        const _: () = assert!(size_of::<Location>() == size_of::<CopyLocation>());
+
+        let null = std::ptr::null();
+        let resource_iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let heap = [1u32, 0, 0, 0, 0];
+        let buffer_desc = |width: u64| Desc {
+            dimension: 1,
+            alignment: 0,
+            width,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        let target_desc = Desc {
+            dimension: 3,
+            width: 8,
+            height: 1,
+            format: 28,
+            layout: 0,
+            ..buffer_desc(0)
+        };
+
+        let (mut target, mut source, mut predicates) = (null, null, null);
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                heap.as_ptr().cast(),
+                0,
+                (&raw const target_desc).cast(),
+                COPY_DEST,
+                null.cast(),
+                &resource_iid,
+                &mut target,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                heap.as_ptr().cast(),
+                0,
+                std::ptr::from_ref(&buffer_desc(4096)).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                heap.as_ptr().cast(),
+                0,
+                std::ptr::from_ref(&buffer_desc(16)).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut predicates,
+            ),
+            S_OK
+        );
+
+        let (src_ptr, _) = crate::resource::buffer_bytes(source).unwrap();
+        // SAFETY: 4096-byte buffer; 512-byte-aligned texel blocks.
+        unsafe {
+            let src = std::slice::from_raw_parts_mut(src_ptr, 4096);
+            for pixel in src[..32].as_chunks_mut::<4>().0 {
+                pixel.copy_from_slice(&[0x11; 4]);
+            }
+            for (i, shade) in [0xaau8, 0xbb, 0xcc, 0xdd, 0xee].into_iter().enumerate() {
+                let at = (i + 1) * 512;
+                src[at..at + 4].copy_from_slice(&[shade; 4]);
+            }
+        }
+
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        type Predication = extern "system" fn(This, This, u64, u32);
+        type Marker = extern "system" fn(This, u32, *const u8, u32);
+        type End = extern "system" fn(This);
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        let predicate = slot::<Predication>(list, 0xf8);
+        let mark = slot::<Marker>(list, 0x1c0);
+        let begin = slot::<Marker>(list, 0x1c8);
+        let end = slot::<End>(list, 0x1d0);
+        let copy = slot::<Copy>(list, 0x80);
+
+        let dst = Location {
+            resource: target,
+            kind: 0,
+            footprint: Footprint {
+                offset: 0,
+                format: 28,
+                width: 8,
+                height: 1,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+        let one_pixel = |index: usize| Location {
+            resource: source,
+            kind: 1,
+            footprint: Footprint {
+                offset: ((index + 1) * 512) as u64,
+                format: 28,
+                width: 1,
+                height: 1,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+
+        let label = b"predication\0";
+        begin(list, 1, label.as_ptr(), label.len() as u32);
+        mark(list, 1, label.as_ptr(), label.len() as u32);
+
+        // Seed all 8 texels to 0x11 before enabling predication.
+        let init = Location {
+            resource: source,
+            kind: 1,
+            footprint: dst.footprint,
+        };
+        copy(list, &dst, 0, 0, 0, &init, null.cast());
+
+        // Invalid operations, misaligned offsets, out-of-range offsets, and
+        // non-buffer resources are ignored without poisoning the host list.
+        predicate(list, predicates, 4, 0);
+        predicate(list, predicates, 16, 0);
+        predicate(list, predicates, 0, 2);
+        predicate(list, target, 0, 0);
+
+        // Slot 0 holds 0; slot 8 is written to a high-bit 64-bit nonzero after
+        // recording, verifying submission-time staging and full 64-bit checks.
+        predicate(list, predicates, 0, 0); // EQUAL_ZERO on 0 -> skipped
+        copy(list, &dst, 0, 0, 0, &one_pixel(0), null.cast());
+
+        predicate(list, predicates, 8, 0); // EQUAL_ZERO on nonzero -> runs
+        copy(list, &dst, 1, 0, 0, &one_pixel(1), null.cast());
+
+        predicate(list, predicates, 8, 1); // NOT_EQUAL_ZERO on nonzero -> skipped
+        copy(list, &dst, 2, 0, 0, &one_pixel(2), null.cast());
+
+        predicate(list, predicates, 0, 1); // NOT_EQUAL_ZERO on 0 -> runs
+        copy(list, &dst, 3, 0, 0, &one_pixel(3), null.cast());
+
+        predicate(list, predicates, 0, 0); // EQUAL_ZERO on 0 (would skip)
+        predicate(list, null, 0, 0); // disabled -> runs again
+        copy(list, &dst, 4, 0, 0, &one_pixel(4), null.cast());
+
+        end(list);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+
+        let (pred_ptr, _) = crate::resource::buffer_bytes(predicates).unwrap();
+        // SAFETY: 16-byte buffer, 8-byte aligned.
+        unsafe {
+            pred_ptr.cast::<u64>().write(0);
+            pred_ptr.cast::<u64>().add(1).write(1u64 << 40);
+        }
+
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert_eq!(host.log_messages(), None);
+
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let host_target = crate::resource::host_resource(target).unwrap();
+        let back = host.new_list().unwrap();
+        let (_, before) = crate::resource::host_transition(target, COPY_SOURCE).unwrap();
+        let out_to = Location {
+            resource: readback.as_raw().cast_const().cast(),
+            kind: 1,
+            footprint: dst.footprint,
+        };
+        let out_from = Location {
+            resource: host_target.as_raw().cast_const().cast(),
+            kind: 0,
+            footprint: dst.footprint,
+        };
+        // SAFETY: an open list, live resources, locations in the host layout.
+        unsafe {
+            back.list.ResourceBarrier(&[crate::host::transition(
+                host_target,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            back.list.CopyTextureRegion(
+                (&raw const out_to).cast(),
+                0,
+                0,
+                0,
+                (&raw const out_from).cast(),
+                None,
+            );
+        }
+        back.close();
+        host.execute(&[&back]);
+        assert_eq!(host.log_messages(), None);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy finished; the buffer holds 256 bytes.
+        let pixels = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE { Begin: 0, End: 32 }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            let slice = std::slice::from_raw_parts(mapped.cast::<[u8; 4]>(), 8).to_vec();
+            readback.Unmap(0, None);
+            slice
+        };
+        assert_eq!(
+            pixels,
+            vec![
+                [0x11; 4], // EQUAL_ZERO on 0 -> skipped
+                [0xbb; 4], // EQUAL_ZERO on (1 << 40) -> copied
+                [0x11; 4], // NOT_EQUAL_ZERO on (1 << 40) -> skipped
+                [0xdd; 4], // NOT_EQUAL_ZERO on 0 -> copied
+                [0xee; 4], // predication disabled -> copied
+                [0x11; 4], [0x11; 4], [0x11; 4],
+            ]
+        );
+
+        assert_eq!(reset(list, allocator, null), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for obj in [list, allocator, queue, predicates, source, target] {
+            assert_eq!(release(obj), 0);
+        }
     }
 }
