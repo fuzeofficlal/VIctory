@@ -376,7 +376,7 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| matches!(a, Atom::Opaque { .. } | Atom::Constant(_)))
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1557,12 +1557,13 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
+            Atom::Opaque { lo, hi } if self.console_lanes => {
+                let hi = if self.x.native.wave64 {
+                    Some(self.get(hi)?)
+                } else {
+                    None
                 };
-                let lo = self.get(v)?;
+                let lo = self.get(lo)?;
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
@@ -1576,7 +1577,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque { .. } => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
@@ -1608,38 +1609,6 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
-    }
-
-    /// The value of the high dword of the wave64 register pair whose low
-    /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
-        if !self.x.native.wave64 {
-            return None;
-        }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
-        };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
-        }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {

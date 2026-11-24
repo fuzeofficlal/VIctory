@@ -45,9 +45,8 @@ pub enum Atom {
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
-    /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// EXEC write it does not follow): the lane's bit of these SSA words.
+    Opaque { lo: Value, hi: Value },
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -586,8 +585,7 @@ impl<'a> Lanes<'a> {
         // Exports go by low dword. A low dword read with two high dwords
         // (one rewritten alone) names no one mask: it is left out, so
         // lowering refuses what reads it instead of taking the other
-        // pair's lanes 32-63. Not where the low dword holds a number: see
-        // the shortcut in `mask`.
+        // pair's lanes 32-63. Opaque guards carry both words separately.
         let (mut high, mut split) = (Map::default(), HashSet::new());
         let keys = self.masks.keys().chain(self.other.keys());
         for &(lo, hi) in keys.chain(&self.seen) {
@@ -665,15 +663,9 @@ impl<'a> Lanes<'a> {
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b.atom(Atom::Opaque { lo: k.0, hi: k.1 }, born)
                 });
                 (m, derived)
             }
@@ -1143,6 +1135,35 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn numeric_exec_guards_keep_both_ssa_words() {
+        let p = build(
+            &[
+                0xBE84_04C1, // s_mov_b64 s[4:5], -1
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0x87FE_047E, // s_and_b64 exec, exec, s[4:5]
+                0x7E02_0287, // v_mov_b32 v1, 7
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0xBE85_03C1, // s_mov_b32 s5, -1
+                0x87FE_047E, // s_and_b64 exec, exec, s[4:5]
+                0x7E02_0287, // v_mov_b32 v1, 7
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let words = [3, 7].map(|access| {
+            let and = &p.blocks[0].insts[access - 1];
+            let lo = and.read(Reg::S(4)).unwrap();
+            let hi = and.read(Reg::S(5)).unwrap();
+            let guard = s.guards[0][access].expect("numeric EXEC guard");
+            assert_eq!(s.bools.support(guard), [Atom::Opaque { lo, hi }]);
+            (lo, hi)
+        });
+        assert_eq!(words[0].0, words[1].0);
+        assert_ne!(words[0].1, words[1].1);
     }
 
     #[test]
