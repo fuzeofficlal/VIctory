@@ -407,6 +407,21 @@ pub(crate) fn srv_mips(texture: &ID3D12Resource, words: &[u32; 10]) -> Option<st
     (view.PlaneSlice == 0 && start < end && (start != 0 || end != count)).then_some(start..end)
 }
 
+/// The selected subresource of a plane-zero UAV on a 2D color target.
+pub(crate) fn uav_mip(texture: &ID3D12Resource, words: Option<&[u32; 10]>) -> Option<u32> {
+    let count = super::color_mip_count(texture)?;
+    let Some(words) = words else {
+        return Some(0); // A default texture UAV selects the first mip.
+    };
+    let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D {
+        return None;
+    }
+    // SAFETY: the view dimension selects this union member.
+    let view = unsafe { desc.Anonymous.Texture2D };
+    (view.PlaneSlice == 0 && view.MipSlice < count).then_some(view.MipSlice)
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);

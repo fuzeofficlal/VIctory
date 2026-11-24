@@ -1123,10 +1123,14 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
+            let this = *resource as This;
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
-            crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            crate::capture::note_target(this);
+            let subresource = crate::resource::host_resource(this)
+                .and_then(|texture| crate::descriptor::host::uav_mip(texture, desc.as_ref()))
+                .unwrap_or(D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+            crate::list::ensure_subresource_state(list, this, subresource, UNORDERED_ACCESS);
         }
         _ => {}
     }
