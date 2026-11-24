@@ -1557,12 +1557,12 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
-        }
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1585,60 +1585,79 @@ impl State {
             why("no host signature");
             return false;
         };
+        if max == 0 {
+            return true;
+        }
+        let stage_ok = match kind {
+            DRAW | INDEXED => {
+                !p.compute
+                    && !p.mesh
+                    && (self.topology != RECTANGLES || self.completes_rectangles() || {
+                        not_run("rectangles");
+                        false
+                    })
+            }
+            MESH => p.mesh,
+            DISPATCH => p.compute,
+            _ => false,
+        };
+        if !stage_ok {
+            #[cfg(feature = "diagnostics")]
+            why(&format!(
+                "prepare failed (compute {}, mesh {}): {}",
+                p.compute,
+                p.mesh,
+                NOT_RUN.with(|w| w.replace(""))
+            ));
+            return false;
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: the clamp binds a compute pipeline of its own and
+        // writes clamped records into the list's own indirect-argument buffer.
+        let Some((clamped, clamped_offset)) =
+            crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max))
+        else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
-        }
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => {
-                (self.topology != RECTANGLES || self.completes_rectangles() || {
-                    not_run("rectangles");
-                    false
-                }) && self.prepare(list, kind == INDEXED)
-            }
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
+            DISPATCH => self.bind(list, p, true),
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &clamped);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
-                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
-                }
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {}): {}",
-                    p.compute,
-                    p.mesh,
-                    NOT_RUN.with(|w| w.replace(""))
-                )),
-            }
+            why(&format!(
+                "prepare failed (compute {}, mesh {}): {}",
+                p.compute,
+                p.mesh,
+                NOT_RUN.with(|w| w.replace(""))
+            ));
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh / indirect_args), the signature
+        // is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
+                &clamped,
+                clamped_offset,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1648,9 +1667,15 @@ impl State {
         if crate::capture::dump_on() {
             let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
             let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+            crate::capture::read_indirect(
+                list,
+                (&clamped, clamped_offset),
+                count,
+                (kind, stride, max),
+                name,
+            );
         }
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

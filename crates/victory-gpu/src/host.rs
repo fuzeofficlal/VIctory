@@ -492,6 +492,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Clamped indirect-argument records written on the GPU for this list,
+    /// reused after a reset.
+    indirect: Mutex<IndirectScratch>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -618,6 +621,16 @@ struct ScratchChunk {
     mapped: usize,
     gpu: u64,
     capacity: u64,
+}
+
+const INDIRECT_CHUNK: u64 = 1 << 20;
+
+/// Default-heap chunks holding clamped indirect-argument records per list.
+#[derive(Default)]
+struct IndirectScratch {
+    chunks: Vec<(ID3D12Resource, u64)>,
+    current: usize,
+    used: u64,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -787,6 +800,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                indirect: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1377,6 +1391,10 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        {
+            let mut indirect = self.indirect.lock().unwrap_or_else(|e| e.into_inner());
+            (indirect.current, indirect.used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1733,6 +1751,70 @@ impl HostList {
         let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
         s.used += len;
         Some(result)
+    }
+
+    /// `len` bytes of GPU-writable default-heap memory (16-byte aligned) for
+    /// clamped indirect-argument records until the list is reset: the host
+    /// buffer, the byte offset within it, and the GPU virtual address.
+    pub(crate) fn indirect_args(&self, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        let host = host()?;
+        let mut s = self.indirect.lock().unwrap_or_else(|e| e.into_inner());
+        let len = len.max(16).next_multiple_of(16);
+        let alloc = |size: u64| -> Option<(ID3D12Resource, u64)> {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut buf: Option<ID3D12Resource> = None;
+            // SAFETY: plain default-heap buffer creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buf,
+                    )
+                    .ok()?;
+                let buf = buf?;
+                name(&buf, || format!("list indirect args {size:#x}"));
+                let gpu = buf.GetGPUVirtualAddress();
+                Some((buf, gpu))
+            }
+        };
+        if len > INDIRECT_CHUNK {
+            let (buffer, gpu) = alloc(len)?;
+            self.deferred().uploads.push(buffer.clone());
+            return Some((buffer, 0, gpu));
+        }
+        if s.used + len > INDIRECT_CHUNK && s.current < s.chunks.len() {
+            (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            let (buffer, gpu) = alloc(INDIRECT_CHUNK)?;
+            s.chunks.push((buffer, gpu));
+            s.used = 0;
+        }
+        let (buffer, gpu) = (s.chunks[s.current].0.clone(), s.chunks[s.current].1);
+        let at = s.used;
+        s.used += len;
+        Some((buffer, at, gpu + at))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
