@@ -5625,14 +5625,15 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
-        let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
+        // Component `k` from address VGPR `base` on; with `half`, two 16-bit
+        // components per VGPR, low half first.
+        let addr_at = |l: &mut Self, base: usize, half: bool, k: usize| -> Result<V, Why> {
             let r = *regs
-                .get(if *a16 { k / 2 } else { k })
+                .get(base + if half { k / 2 } else { k })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
+            if !half {
                 return Ok(x);
             }
             let c = l.cur;
@@ -5640,6 +5641,7 @@ impl<'a> Lower<'a> {
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
+        let addr_val = |l: &mut Self, k: usize| addr_at(l, 0, *a16, k);
         let src = self
             .descriptors
             .get(&(site, false))
@@ -5784,7 +5786,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_g16" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -5852,13 +5854,21 @@ impl<'a> Lower<'a> {
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
+            // gradients (x then y, f16 per direction with `_g16`) come before
+            // the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            let g16 = name.ends_with("_g16");
+            let grad_regs = if op == 63 {
+                if g16 { spatial.div_ceil(2) } else { spatial }
+            } else {
+                0
+            };
+            let coord_base = first + 2 * grad_regs;
             let mut cs = vec![fu; 4];
-            // With a16, sampling coordinates and LOD are f16.
-            let to_float = |l: &mut Self, x: V| {
-                if *a16 {
+            // With a16, sampling coordinates and LOD are f16; with `_g16`,
+            // explicit gradients are f16.
+            let to_float = |l: &mut Self, half: bool, x: V| {
+                if half {
                     let f = l.s.t.f32;
                     l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x])
                 } else {
@@ -5866,8 +5876,8 @@ impl<'a> Lower<'a> {
                 }
             };
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                let x = addr_val(self, first + grads + k)?;
-                *slot = to_float(self, x);
+                let x = addr_at(self, coord_base, *a16, k)?;
+                *slot = to_float(self, *a16, x);
             }
             if kind == 5 {
                 if *unorm || op == 63 || op == 81 {
@@ -5928,7 +5938,7 @@ impl<'a> Lower<'a> {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
                         // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
+                        let w = addr_at(self, 0, false, 0)?;
                         let w = self
                             .s
                             .m
@@ -5950,7 +5960,7 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
+                    let bias = addr_at(self, 0, false, 0)?;
                     let bias = self.as_float(bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
@@ -5966,10 +5976,10 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        let x = addr_at(self, first, g16, k)?;
+                        g[k] = to_float(self, g16, x);
+                        let y = addr_at(self, first + grad_regs, g16, k)?;
+                        g[3 + k] = to_float(self, g16, y);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -5984,7 +5994,7 @@ impl<'a> Lower<'a> {
                     )
                 }
                 64 | 65 => {
-                    let reference = addr_val(self, first - 1)?;
+                    let reference = addr_at(self, 0, false, first - 1)?;
                     let reference = self.as_float(reference);
                     args.extend(&os);
                     args.push(reference);
@@ -5999,8 +6009,8 @@ impl<'a> Lower<'a> {
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
-                        to_float(self, x)
+                        let x = addr_at(self, coord_base, *a16, coords)?;
+                        to_float(self, *a16, x)
                     } else {
                         self.s.m.f32(0)
                     };
@@ -6023,7 +6033,7 @@ impl<'a> Lower<'a> {
                         return Err("a gather of several channels");
                     }
                     if offset_word {
-                        let w = addr_val(self, 0)?;
+                        let w = addr_at(self, 0, false, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
                             // Bits at..at+5 sign-extended: shift up, then down.
                             let left = self.s.m.i32(at);
@@ -7099,9 +7109,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7126,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7148,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -7417,5 +7427,308 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    fn v_mov_lit(vdst: u8, lit: u32) -> [u32; 2] {
+        [0x7E00_02FF | (u32::from(vdst) << 17), lit]
+    }
+
+    fn mimg_sample_d(g16: bool, dim: u8, dmask: u8, vdata: u8, vaddr: u8, a16: bool) -> [u32; 2] {
+        let op: u32 = if g16 { 0x0a2 } else { 0x022 };
+        [
+            0x3C << 26
+                | ((op & 0x7F) << 18)
+                | (u32::from(dmask & 0xF) << 8)
+                | (u32::from(dim & 7) << 3)
+                | ((op >> 7) & 1),
+            u32::from(a16) << 30
+                | (5 << 21)
+                | (2 << 16)
+                | (u32::from(vdata) << 8)
+                | u32::from(vaddr),
+        ]
+    }
+
+    fn buffer_store(vdata: u8, byte_off: u16) -> [u32; 2] {
+        [
+            0x38 << 26 | 0x1C << 18 | u32::from(byte_off & 0xFFF),
+            0x80 << 24 | (4 << 16) | (u32::from(vdata) << 8),
+        ]
+    }
+
+    fn sample_d_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let range = |kind, table_offset_dwords, dwords, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data,
+            slot: user_data,
+        };
+        (
+            vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
+            vec![
+                range(ResourceType::Srv, 0, 8, 0),
+                range(ResourceType::Uav, 8, 4, 0),
+                range(ResourceType::Sampler, 0, 4, 1),
+            ],
+        )
+    }
+
+    const DESCRIPTOR_PREAMBLE: [u32; 10] = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+        0xF408_0402,
+        0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0503,
+        0xFA00_0000, // s_load_dwordx4 s[20:23], s[6:7], null
+    ];
+
+    #[test]
+    fn sample_d_and_sample_d_g16_lower_and_validate_across_dimensions() {
+        // (dim, [(!a16, !g16), (a16, !g16), (!a16, g16), (a16, g16)] address dwords)
+        let dims: [(u8, [u8; 4]); 5] = [
+            (0, [3, 3, 3, 3]), // 1D
+            (1, [6, 5, 4, 3]), // 2D
+            (2, [9, 8, 7, 6]), // 3D
+            (4, [4, 3, 4, 3]), // 1D_ARRAY
+            (5, [7, 6, 5, 4]), // 2D_ARRAY
+        ];
+        #[cfg(windows)]
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+
+        for (dim, counts) in dims {
+            for (idx, (g16, a16)) in [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let dwords = counts[idx];
+                let build_prog = |init_dwords: u8| {
+                    let mut words = DESCRIPTOR_PREAMBLE.to_vec();
+                    for k in 0..init_dwords {
+                        words.extend(v_mov_lit(1 + k, 0x3800_3800));
+                    }
+                    words.extend(mimg_sample_d(g16, dim, 0x1, 32, 1, a16));
+                    words.extend(buffer_store(32, 0));
+                    words.push(S_ENDPGM);
+                    let (layout, used) = sample_d_tables();
+                    lower_with(&words, layout, used)
+                };
+
+                // Leaving the last address VGPR unwritten makes it an unknown CS input,
+                // confirming fields.rs and lower.rs agree on the exact VGPR count.
+                let code_short: Vec<u8> = {
+                    let mut words = DESCRIPTOR_PREAMBLE.to_vec();
+                    for k in 0..(dwords - 1) {
+                        words.extend(v_mov_lit(1 + k, 0));
+                    }
+                    words.extend(mimg_sample_d(g16, dim, 0x1, 32, 1, a16));
+                    words.extend(buffer_store(32, 0));
+                    words.push(S_ENDPGM);
+                    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+                };
+                let p_short = ir::build(&code_short, false, 64).unwrap();
+                assert!(
+                    p_short.inputs.iter().any(|&(r, _)| r == ir::Reg::V(dwords)),
+                    "dim={dim} a16={a16} g16={g16} should read v{dwords}"
+                );
+
+                let lowered = build_prog(dwords)
+                    .unwrap_or_else(|e| panic!("dim={dim} a16={a16} g16={g16} failed: {e}"));
+                #[cfg(windows)]
+                if let Some(v) = validator.as_mut() {
+                    v.validate(&mut lowered.dxil.clone()).unwrap_or_else(|e| {
+                        panic!("DXIL validation failed for dim={dim} a16={a16} g16={g16}: {e}")
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn sample_d_and_sample_d_g16_execute_independent_a16_and_g16_on_gpu() {
+        use super::super::HostShader;
+        use super::super::host::{Dispatch, Host, Root, View};
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        // 4x4 texture:
+        // - Green identifies quadrant: TL=1, TR=2, BL=4, BR=8.
+        //   Texel (2, 1) center is at (u, v) = (0.625, 0.375) -> Green = 2, Red = 0
+        //   (swapping u and v lands in BL -> Green = 4; zero lands in TL -> Green = 1).
+        // - Red is 16 on top/bottom rows (y = 0, 3) and 0 on middle rows (y = 1, 2),
+        //   so vertical anisotropic footprint (dvy = 1.0) pulls Red > 2 while
+        //   horizontal footprint (dhx = 1.0) keeps Red == 0 and pulls Green < 1.9.
+        let mut texels = [[0.0f32; 4]; 16];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let red = if y == 0 || y == 3 { 16.0 } else { 0.0 };
+                let green = match (x >= 2, y >= 2) {
+                    (false, false) => 1.0,
+                    (true, false) => 2.0,
+                    (false, true) => 4.0,
+                    (true, true) => 8.0,
+                };
+                texels[y * 4 + x] = [red, green, 0.0, 1.0];
+            }
+        }
+        let samplers = [D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_ANISOTROPIC,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 4,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        }];
+
+        // Exact dyadic f16/f32 constants:
+        // 0.125 = 0x3000, 0.375 = 0x3600, 0.625 = 0x3900, 1.0 = 0x3C00.
+        let pack_addrs = |a16: bool, g16: bool, dh: [u16; 2], dv: [u16; 2]| -> Vec<u32> {
+            let f32_of = |h: u16| match h {
+                0x0000 => 0.0f32.to_bits(),
+                0x3000 => 0.125f32.to_bits(),
+                0x3600 => 0.375f32.to_bits(),
+                0x3900 => 0.625f32.to_bits(),
+                0x3C00 => 1.0f32.to_bits(),
+                _ => unreachable!(),
+            };
+            let mut regs = Vec::new();
+            if g16 {
+                regs.push(u32::from(dh[0]) | (u32::from(dh[1]) << 16));
+                regs.push(u32::from(dv[0]) | (u32::from(dv[1]) << 16));
+            } else {
+                regs.extend([f32_of(dh[0]), f32_of(dh[1]), f32_of(dv[0]), f32_of(dv[1])]);
+            }
+            if a16 {
+                regs.push(0x3900 | (0x3600 << 16));
+            } else {
+                regs.extend([0.625f32.to_bits(), 0.375f32.to_bits()]);
+            }
+            regs
+        };
+
+        let mut shaders = Vec::new();
+        for (g16, a16) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut words = DESCRIPTOR_PREAMBLE.to_vec();
+            let cases = [
+                ([0x3000, 0x0000], [0x0000, 0x3000]), // small isotropic
+                ([0x3C00, 0x0000], [0x0000, 0x3000]), // horizontal stretch (dhx = 1.0)
+                ([0x3000, 0x0000], [0x0000, 0x3C00]), // vertical stretch (dvy = 1.0)
+            ];
+            for (idx, (dh, dv)) in cases.into_iter().enumerate() {
+                let addrs = pack_addrs(a16, g16, dh, dv);
+                // Overwrite surrounding VGPRs with 0 before loading exact `addrs`
+                // so any shifted read sees (0, 0) instead of a leftover register.
+                for r in 1..=8u8 {
+                    words.extend(v_mov_lit(r, 0));
+                }
+                for (k, val) in addrs.into_iter().enumerate() {
+                    words.extend(v_mov_lit(1 + k as u8, val));
+                }
+                let dst = 32 + (2 * idx) as u8;
+                words.extend(mimg_sample_d(g16, 1, 0x3, dst, 1, a16));
+                words.extend(buffer_store(dst, (8 * idx) as u16));
+                words.extend(buffer_store(dst + 1, (8 * idx + 4) as u16));
+            }
+            words.push(S_ENDPGM);
+            let (layout, used) = sample_d_tables();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 64,
+                layout,
+                used,
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 2 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 64).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: lowered.dxil,
+                user_data: lowered.user_data,
+                samplers: lowered.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: lowered.root_cbvs,
+                root_srvs: lowered.root_srvs,
+            };
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut shader.dxil.clone()).unwrap();
+            }
+            shaders.push((a16, g16, shader));
+        }
+
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let views = [View::Texture(4, 4, &texels), View::RawUav(6)];
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            for (a16, g16, shader) in &shaders {
+                let (root, pso) = host.compute_pipeline(shader).unwrap();
+                let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &views,
+                            samplers: &samplers,
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let f: Vec<f32> = out[0].iter().copied().map(f32::from_bits).collect();
+                assert_eq!(
+                    (f[0], f[1]),
+                    (0.0, 2.0),
+                    "{label} a16={a16} g16={g16}: small grad got {:?}",
+                    &f[0..2]
+                );
+                assert!(
+                    f[2] == 0.0 && f[3] < 1.9,
+                    "{label} a16={a16} g16={g16}: dhx stretch got {:?}",
+                    &f[2..4]
+                );
+                assert!(
+                    f[4] > 2.0,
+                    "{label} a16={a16} g16={g16}: dvy stretch got {:?}",
+                    &f[4..6]
+                );
+            }
+        }
     }
 }

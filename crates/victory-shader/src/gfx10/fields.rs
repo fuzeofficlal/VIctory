@@ -767,8 +767,9 @@ fn data_dwords(name: &str) -> u8 {
     n
 }
 
-/// Address dwords of an image opcode: offset, bias, compare, derivatives,
-/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
+/// Address dwords of an image opcode: offset, bias, compare, derivatives
+/// (packed per direction with `_g16`), then coordinates and LOD/clamp/mip
+/// (packed in pairs with `a16`).
 fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
@@ -789,7 +790,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         "image_get_resinfo" => return 1,
         _ => {}
     }
-    let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
+    let (mut whole, mut derivs, mut packed, mut g16): (u8, u8, u8, bool) = (0, 0, coords, false);
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -798,6 +799,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
             match token {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
+                "g16" => g16 = true,
                 "l" | "cl" => packed += 1,
                 _ => {}
             }
@@ -805,9 +807,190 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    let deriv_dwords = if g16 {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
+        2 * derivs
+    };
+    let coord_dwords = if a16 { packed.div_ceil(2) } else { packed };
+    whole + deriv_dwords + coord_dwords
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx10::decode;
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn decode_one(words: &[u32], wave64: bool) -> Fields {
+        let code: Vec<u8> = words
+            .iter()
+            .chain(&[S_ENDPGM])
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        decode(&code).unwrap()[0].fields(wave64)
+    }
+
+    fn mimg_seq(op: u16, dim: u8, dmask: u8, vaddr: u8, a16: bool, d16: bool) -> [u32; 2] {
+        [
+            0x3C << 26
+                | ((op as u32 & 0x7F) << 18)
+                | ((dmask as u32 & 0xF) << 8)
+                | ((dim as u32 & 7) << 3)
+                | ((op as u32 >> 7) & 1),
+            (d16 as u32) << 31
+                | (a16 as u32) << 30
+                | (2 << 21)
+                | (4 << 16)
+                | (16 << 8)
+                | (vaddr as u32),
+        ]
+    }
+
+    fn mimg_nsa(op: u16, dim: u8, a16: bool, regs: &[u8]) -> Vec<u32> {
+        let extra = regs.len().saturating_sub(1).div_ceil(4);
+        assert!((1..=3).contains(&extra));
+        let mut out = vec![
+            0x3C << 26
+                | ((op as u32 & 0x7F) << 18)
+                | (0xF << 8)
+                | ((dim as u32 & 7) << 3)
+                | ((extra as u32) << 1)
+                | ((op as u32 >> 7) & 1),
+            (a16 as u32) << 30 | (2 << 21) | (4 << 16) | (16 << 8) | (regs[0] as u32),
+        ];
+        for chunk in regs[1..].chunks(4) {
+            let mut w = 0u32;
+            for (k, &r) in chunk.iter().enumerate() {
+                w |= (r as u32) << (8 * k);
+            }
+            out.push(w);
+        }
+        out
+    }
+
+    #[test]
+    fn sample_d_a16_and_g16_pack_independently_across_all_dimensions() {
+        // Expected address dwords for [(!a16, !g16), (a16, !g16), (!a16, g16), (a16, g16)]
+        // per dimension: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY.
+        let expected: [(u8, [u8; 4]); 8] = [
+            (0, [3, 3, 3, 3]), // 1D: 1 coord, 1 grad/dir (each direction dword-aligned)
+            (1, [6, 5, 4, 3]), // 2D: 2 coords, 2 grads/dir
+            (2, [9, 8, 7, 6]), // 3D: 3 coords, 3 grads/dir
+            (3, [7, 6, 5, 4]), // CUBE: 3 coords, 2 grads/dir
+            (4, [4, 3, 4, 3]), // 1D_ARRAY: 2 coords, 1 grad/dir
+            (5, [7, 6, 5, 4]), // 2D_ARRAY: 3 coords, 2 grads/dir
+            (6, [7, 6, 5, 4]), // 2D_MSAA: 3 coords, 2 grads/dir
+            (7, [8, 6, 6, 4]), // 2D_MSAA_ARRAY: 4 coords, 2 grads/dir
+        ];
+        for (dim, counts) in expected {
+            for (idx, (g16, a16)) in [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let op = if g16 { 0x0a2 } else { 0x022 };
+                let want = counts[idx];
+                let Fields::Image {
+                    addr, a16: got_a16, ..
+                } = decode_one(&mimg_seq(op, dim, 0xF, 4, a16, false), false)
+                else {
+                    panic!("expected Fields::Image");
+                };
+                assert_eq!(got_a16, a16);
+                assert_eq!(
+                    addr,
+                    vec![Operand::Vector {
+                        reg: 4,
+                        dwords: want
+                    }],
+                    "dim={dim} a16={a16} g16={g16}"
+                );
+
+                // NSA form decodes the same number of single-dword VGPR operands.
+                let nsa_regs: Vec<u8> = (0..want).map(|k| 10 + 3 * k).collect();
+                let Fields::Image { addr: nsa_addr, .. } =
+                    decode_one(&mimg_nsa(op, dim, a16, &nsa_regs), false)
+                else {
+                    panic!("expected Fields::Image");
+                };
+                let want_nsa: Vec<Operand> = nsa_regs
+                    .iter()
+                    .map(|&reg| Operand::Vector { reg, dwords: 1 })
+                    .collect();
+                assert_eq!(nsa_addr, want_nsa, "NSA dim={dim} a16={a16} g16={g16}");
+            }
+        }
+    }
+
+    #[test]
+    fn sample_d_modifiers_cl_o_c_and_cd_pack_independently() {
+        // (opcode, dim, [(!a16), (a16)])
+        let cases: &[(u16, u8, [u8; 2])] = &[
+            (0x023, 1, [7, 6]),  // image_sample_d_cl 2D: 4 + (2+1) -> 4 + ceil(3/2)=2
+            (0x0a3, 1, [5, 4]),  // image_sample_d_cl_g16 2D: 2 + 3 -> 2 + 2
+            (0x02b, 1, [8, 7]),  // image_sample_c_d_cl 2D: 1 + 4 + 3 -> 1 + 4 + 2
+            (0x0ab, 1, [6, 5]),  // image_sample_c_d_cl_g16 2D: 1 + 2 + 3 -> 1 + 2 + 2
+            (0x032, 2, [10, 9]), // image_sample_d_o 3D: 1 + 6 + 3 -> 1 + 6 + 2
+            (0x0b2, 2, [8, 7]),  // image_sample_d_o_g16 3D: 1 + 4 + 3 -> 1 + 4 + 2
+            (0x03b, 5, [10, 9]), // image_sample_c_d_cl_o 2D_ARRAY: 2 + 4 + 4 -> 2 + 4 + 2? wait: 3+1=4 -> ceil(4/2)=2 => 8!
+            (0x0bb, 5, [8, 6]),  // image_sample_c_d_cl_o_g16 2D_ARRAY: 2 + 2 + 4 -> 2 + 2 + 2
+            (0x068, 1, [6, 5]),  // image_sample_cd 2D: coarse derivs have no _g16, stay 32-bit
+            (0x06f, 1, [9, 8]),  // image_sample_c_cd_cl_o 2D: 2 + 4 + 3 -> 2 + 4 + 2
+        ];
+        for &(op, dim, [full, half]) in cases {
+            let expected_half = if op == 0x03b { 8 } else { half };
+            for (a16, want) in [(false, full), (true, expected_half)] {
+                let Fields::Image { addr, .. } =
+                    decode_one(&mimg_seq(op, dim, 0xF, 0, a16, false), false)
+                else {
+                    panic!("expected Fields::Image");
+                };
+                assert_eq!(
+                    addr,
+                    vec![Operand::Vector {
+                        reg: 0,
+                        dwords: want
+                    }],
+                    "op={op:#x} dim={dim} a16={a16}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_gradient_mimg_address_and_data_counts() {
+        // Load/mip, sample_l/b/c/o, gather4, resinfo, and BVH ray intersections.
+        let addr_cases: &[(u16, u8, [u8; 2])] = &[
+            (0x000, 2, [3, 2]),  // image_load 3D
+            (0x001, 1, [3, 2]),  // image_load_mip 2D (x, y, mip)
+            (0x001, 0, [2, 1]),  // image_load_mip 1D (x, mip)
+            (0x00e, 2, [1, 1]),  // image_get_resinfo
+            (0x020, 5, [3, 2]),  // image_sample 2D_ARRAY
+            (0x024, 1, [3, 2]),  // image_sample_l 2D
+            (0x025, 1, [3, 2]),  // image_sample_b 2D (whole bias + 2 coords)
+            (0x05c, 1, [5, 4]),  // image_gather4_c_l_o 2D (offset + cmp + x,y,lod)
+            (0x0e6, 0, [11, 8]), // image_bvh_intersect_ray
+            (0x0e7, 0, [12, 9]), // image_bvh64_intersect_ray
+        ];
+        for &(op, dim, [full, half]) in addr_cases {
+            for (a16, want) in [(false, full), (true, half)] {
+                let Fields::Image { addr, sampler, .. } =
+                    decode_one(&mimg_seq(op, dim, 0x7, 2, a16, true), false)
+                else {
+                    panic!("expected Fields::Image");
+                };
+                assert_eq!(
+                    addr,
+                    vec![Operand::Vector {
+                        reg: 2,
+                        dwords: want
+                    }],
+                    "op={op:#x} dim={dim} a16={a16}"
+                );
+                let sampled = matches!(op, 0x020 | 0x024 | 0x025 | 0x05c);
+                assert_eq!(sampler.is_some(), sampled, "op={op:#x}");
+            }
+        }
     }
 }
