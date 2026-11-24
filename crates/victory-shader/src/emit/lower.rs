@@ -7327,6 +7327,52 @@ mod tests {
     }
 
     #[test]
+    fn a_live_descriptor_word_stays_missing_through_two_joins() {
+        let mut words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (table)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0 (root constant)
+            0xBF85_0002, // take the descriptor arm when SCC is set
+            0xBE89_0391, // s_mov_b32 s9, 17
+            0xBF82_0006, // skip the descriptor arm
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xBF85_0001, // if SCC is set, keep the descriptor word live
+            0xBE89_039D, // s_mov_b32 s9, 29
+            0x7E04_0209, // v_mov_b32 v2, s9
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let reason = |words: &[u32]| {
+            let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+            let used = vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }];
+            match lower_wave(words, layout, used, false) {
+                Ok(_) => None,
+                Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let through_two_joins = reason(&words);
+        words[13] = 0xBF82_0001; // skip the overwrite unconditionally: one join
+        assert_eq!(through_two_joins, reason(&words));
+    }
+
+    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
