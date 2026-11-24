@@ -285,6 +285,8 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Capture, work and result buffers reused by indexed topology expansion.
+    pub(crate) topology_scratch: Mutex<crate::topology::Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -475,6 +477,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                topology_scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -1056,6 +1059,32 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// The latest known producer of an index range wrote its host shadow on
+    /// the GPU. Deferred CPU copies still use the per-draw CPU snapshot.
+    pub(crate) fn gpu_index_source(
+        &self,
+        address: u64,
+        len: u64,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let overlaps = |at: usize, size: usize| {
+            size != 0
+                && (at as u64) < address.saturating_add(len)
+                && address < (at as u64).saturating_add(size as u64)
+        };
+        for step in self.deferred().copies.iter().rev() {
+            match step {
+                Step::GpuWrite(written, at, size) if overlaps(*at, *size) => {
+                    return Some(written.clone());
+                }
+                Step::Copy(dst, _, size) if overlaps(*dst, *size) => return None,
+                // The range an opaque CPU write updates is not known.
+                Step::Run(_) => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

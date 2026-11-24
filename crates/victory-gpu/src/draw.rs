@@ -164,6 +164,24 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+struct IndexedDraw {
+    indices: u32,
+    instances: u32,
+    first: u32,
+    base: i32,
+    first_instance: u32,
+}
+
+struct CpuIndices {
+    address: u64,
+    len: usize,
+    count: u32,
+    expanded: u32,
+    cut: Option<u32>,
+    pad: u32,
+    format: DXGI_FORMAT,
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -330,17 +348,27 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
-        }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = Self::graphics_pipeline(self.pipeline as This, mesh) else {
             return false;
         };
+        self.prepare_draw_state(list, p, indexed)
+    }
+
+    fn graphics_pipeline<'a>(pipeline: This, mesh: bool) -> Option<&'a HostPipeline> {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(pipeline) {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(pipeline)?;
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return None;
         }
+        Some(p)
+    }
+
+    fn prepare_draw_state(&mut self, list: &HostList, p: &HostPipeline, indexed: bool) -> bool {
+
         self.bind(list, p, false);
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -913,23 +941,22 @@ impl State {
         Some((out_count, base))
     }
 
-    /// Binds a submission-filled scratch index buffer expanding an indexed
-    /// console-only topology draw into a host triangle or line list, preserving
-    /// index format (`R16_UINT`/`R32_UINT`) and strip-cut semantics.
-    fn expand_indexed(
-        &self,
+    /// Draws an indexed console-only topology using an ordered GPU expansion.
+    fn draw_expanded(
+        &mut self,
         list: &HostList,
         kind: crate::primitive::ExpandedTopology,
-        indices: u32,
-        first: u32,
-        base: i32,
-    ) -> Option<u32> {
-        const R32_UINT: u32 = 42;
-        const R16_UINT: u32 = 57;
+        draw: IndexedDraw,
+    ) -> Option<()> {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
+
+        let pipeline = Self::graphics_pipeline(self.pipeline as This, false)?;
         let v = self.index;
-        let is_u16 = match v.format {
-            R16_UINT => true,
-            R32_UINT => false,
+        let format = DXGI_FORMAT(v.format as i32);
+        let is_u16 = format == DXGI_FORMAT_R16_UINT;
+        let bytes = match format {
+            DXGI_FORMAT_R16_UINT => 2,
+            DXGI_FORMAT_R32_UINT => 4,
             _ => {
                 once!(format = v.format, "unsupported index format for console topology");
                 return None;
@@ -938,66 +965,124 @@ impl State {
         if v.address == 0 || v.size == 0 {
             return None;
         }
-        let elem_bytes: u64 = if is_u16 { 2 } else { 4 };
-        let avail = (u64::from(v.size) / elem_bytes).saturating_sub(u64::from(first));
-        let count = u64::from(indices).min(avail) as u32;
-        let max_out = kind.max_output_indices(count);
-        if max_out == 0 {
-            return Some(0);
+        let available = (v.size / bytes).saturating_sub(draw.first);
+        let count = draw.indices.min(available);
+        let expanded = kind.max_output_indices(count);
+        if expanded == 0 {
+            return Some(());
         }
-        let src_addr = v.address.checked_add(u64::from(first).checked_mul(elem_bytes)?)?;
-        let src_bytes = usize::try_from(u64::from(count).checked_mul(elem_bytes)?).ok()?;
-        let out_bytes = u64::from(max_out).checked_mul(elem_bytes)?;
-        let out_bytes_u32 = u32::try_from(out_bytes).ok()?;
-        let (gpu, to) = list.scratch(out_bytes)?;
-        let strip_cut = crate::pipeline::host_pipeline(self.pipeline as This)
-            .map_or(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, |p| p.strip_cut);
-        let to_addr = to as usize;
-        let fallback_pad = (-i64::from(base)).max(0) as u32;
-        if is_u16 {
-            let cut = (strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF).then_some(u16::MAX);
-            let pad = fallback_pad.min(u32::from(u16::MAX)) as u16;
-            list.defer_host(move || {
-                let mut src = vec![0u16; count as usize];
-                crate::host::copy_mapped(
-                    src.as_mut_ptr().cast::<u8>(),
-                    src_addr as *const u8,
-                    src_bytes,
-                    false,
-                );
-                // SAFETY: `to_addr` points to `max_out` writable `u16` slots owned by this list.
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(to_addr as *mut u16, max_out as usize)
-                };
-                kind.expand_indexed_u16(&src, cut, pad, dst);
-            });
+
+        let address = v.address.checked_add(u64::from(draw.first) * u64::from(bytes))?;
+        let len = u64::from(count) * u64::from(bytes);
+        let strip_cut = pipeline.strip_cut;
+        let cut = if is_u16 {
+            (strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF).then_some(u16::MAX.into())
         } else {
-            let cut =
-                (strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF).then_some(u32::MAX);
-            list.defer_host(move || {
-                let mut src = vec![0u32; count as usize];
-                crate::host::copy_mapped(
-                    src.as_mut_ptr().cast::<u8>(),
-                    src_addr as *const u8,
-                    src_bytes,
-                    false,
-                );
-                // SAFETY: `to_addr` points to `max_out` writable `u32` slots owned by this list.
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(to_addr as *mut u32, max_out as usize)
-                };
-                kind.expand_indexed_u32(&src, cut, fallback_pad, dst);
-            });
-        }
-        let view = D3D12_INDEX_BUFFER_VIEW {
-            BufferLocation: gpu,
-            SizeInBytes: out_bytes_u32,
-            Format: DXGI_FORMAT(v.format as i32),
+            (strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF).then_some(u32::MAX)
         };
-        // SAFETY: an open list; the view names live scratch upload memory.
-        unsafe { list.list.IASetIndexBuffer(Some(&view)) };
-        Some(max_out)
+        let pad = (-i64::from(draw.base)).max(0) as u32;
+        let pad = if is_u16 { pad.min(u16::MAX.into()) } else { pad };
+
+        // Select the same shadow as ordinary IA. The original CPU path
+        // still snapshots CPU-produced inputs in deferred command order.
+        let gpu = list.gpu_index_source(address, len).and_then(|written| {
+            let shadow = crate::shadow::find(v.address, u64::from(v.size))?;
+            if !std::sync::Arc::ptr_eq(&written, &shadow) {
+                return None;
+            }
+            let output = crate::topology::expand(list, &crate::topology::Draw {
+                source: D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: shadow.gpu(v.address),
+                    SizeInBytes: v.size,
+                    Format: format,
+                },
+                first: draw.first,
+                count,
+                kind,
+                expanded,
+                cut,
+                pad,
+            })?;
+            shadow.refresh(list, v.address, u64::from(v.size));
+            Some(output)
+        });
+
+        if gpu.is_some() {
+            // Restore app bindings after the private draw and dispatches.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+        }
+        self.prepare_draw_state(list, pipeline, false);
+        if let Some(output) = &gpu {
+            // SAFETY: the private output is ready for IA and list-owned.
+            unsafe {
+                list.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(kind.host_topology() as i32));
+                list.list.IASetIndexBuffer(Some(&output.view));
+            }
+        } else {
+            Self::expand_indexed_cpu(list, kind, CpuIndices {
+                address,
+                len: usize::try_from(len).ok()?,
+                count,
+                expanded,
+                cut,
+                pad,
+                format,
+            })?;
+        }
+
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("indexed {kind:?} {expanded}x{}", draw.instances), false));
+        // SAFETY: either expansion bound its corresponding live index view.
+        unsafe {
+            list.list.DrawIndexedInstanced(expanded, draw.instances, 0, draw.base, draw.first_instance);
+        }
+        if let Some(output) = gpu {
+            output.finish(list);
+        }
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        Some(())
     }
+
+
+    /// Keeps CPU-produced indices in the existing deferred command order.
+    fn expand_indexed_cpu(
+        list: &HostList,
+        kind: crate::primitive::ExpandedTopology,
+        indices: CpuIndices,
+    ) -> Option<()> {
+        let CpuIndices { address, len, count, expanded, cut, pad, format } = indices;
+        let is_u16 = format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
+        let bytes = u64::from(expanded) * if is_u16 { 2 } else { 4 };
+        let size = u32::try_from(bytes).ok()?;
+        let (gpu, ptr) = list.scratch(bytes)?;
+        let ptr = ptr as usize;
+        list.defer_host(move || {
+            if is_u16 {
+                let mut src = vec![0u16; count as usize];
+                crate::host::copy_mapped(src.as_mut_ptr().cast(), address as *const u8, len, false);
+                // SAFETY: this draw owns these scratch slots until list reset.
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u16, expanded as usize) };
+                kind.expand_indexed_u16(&src, cut.map(|c| c as u16), pad as u16, dst);
+            } else {
+                let mut src = vec![0u32; count as usize];
+                crate::host::copy_mapped(src.as_mut_ptr().cast(), address as *const u8, len, false);
+                // SAFETY: this draw owns these scratch slots until list reset.
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u32, expanded as usize) };
+                kind.expand_indexed_u32(&src, cut, pad, dst);
+            }
+        });
+        // SAFETY: an open list and live scratch holding the expanded index data.
+        unsafe {
+            list.list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: gpu,
+                SizeInBytes: size,
+                Format: format,
+            }));
+        }
+        Some(())
+    }
+
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
@@ -1067,38 +1152,28 @@ impl State {
         self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
-        }
-        let expanded = crate::primitive::ExpandedTopology::from_console(self.topology);
-        let ran = self.topology != RECTANGLES && self.prepare(list, expanded.is_none());
-        if ran {
-            if let Some(kind) = expanded {
-                if let Some(count) = self.expand_indexed(list, kind, indices, first, base) {
-                    if count > 0 {
-                        #[cfg(feature = "diagnostics")]
-                        list.note_op(|| {
-                            self.op_text(format!("indexed {kind:?} {count}x{instances}"), false)
-                        });
-                        // SAFETY: an open list with expanded scratch index buffer bound.
-                        unsafe {
-                            list.list
-                                .DrawIndexedInstanced(count, instances, 0, base, first_instance)
-                        };
-                        DRAWN.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return;
-                }
-            } else {
-                #[cfg(feature = "diagnostics")]
-                list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-                // SAFETY: an open list with everything set.
-                unsafe {
-                    list.list
-                        .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-                };
-                DRAWN.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(kind) = crate::primitive::ExpandedTopology::from_console(self.topology) {
+            let draw = IndexedDraw {
+                indices,
+                instances,
+                first,
+                base,
+                first_instance,
+            };
+            if self.draw_expanded(list, kind, draw).is_some() {
                 return;
             }
+        } else if self.prepare(list, true) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            // SAFETY: an open list with everything set.
+            unsafe {
+                list.list.DrawIndexedInstanced(indices, instances, first, base, first_instance);
+            }
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return;
         }
+
         DROPPED.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         dropped(self.pipeline);

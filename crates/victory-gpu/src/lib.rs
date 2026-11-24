@@ -50,6 +50,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod topology;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
