@@ -336,6 +336,53 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 #[test]
+fn integer_min3_med3_max3_follow_signed_and_unsigned_order() {
+    // Every rank changes between signed and unsigned order for this triplet.
+    let (a, b, c) = ((-3_i32) as u32, (-1_i32) as u32, 2);
+    let cases = [
+        [a, b, c, 0],
+        [a, c, b, 0],
+        [b, a, c, 0],
+        [b, c, a, 0],
+        [c, a, b, 0],
+        [c, b, a, 0],
+        [1, 5, 1, 0],
+        [9, 5, 9, 0],
+        [7, 7, 7, 0],
+        [i32::MIN as u32, i32::MAX as u32, 0, 0],
+        [0, u32::MAX, 1, 0],
+    ];
+    let ops = [
+        ("v_min3_i32", 0x152, true, 0),
+        ("v_min3_u32", 0x153, false, 0),
+        ("v_med3_i32", 0x158, true, 1),
+        ("v_med3_u32", 0x159, false, 1),
+        ("v_max3_i32", 0x155, true, 2),
+        ("v_max3_u32", 0x156, false, 2),
+    ];
+    for (name, opcode, signed, rank) in ops {
+        let words = vop3(opcode, 0, vgpr(1), vgpr(2), vgpr(3));
+        let code: Vec<u8> = [words[0], words[1], S_ENDPGM]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let decoded = crate::gfx10::decode(&code).expect("decode VOP3 instruction");
+        assert_eq!(decoded[0].name(), Some(name));
+
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &cases, |backend, _, [a, b, c, _], got| {
+            let mut ordered = [a, b, c];
+            if signed {
+                ordered.sort_unstable_by_key(|&word| word as i32);
+            } else {
+                ordered.sort_unstable();
+            }
+            assert_eq!(got, ordered[rank], "{backend}: {name} {a:#x} {b:#x} {c:#x}");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
