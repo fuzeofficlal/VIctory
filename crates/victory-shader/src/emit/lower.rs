@@ -2198,14 +2198,37 @@ impl<'a> Lower<'a> {
                 _ => return Err("an LDS read of bytes or halves"),
             };
             let at = byte_addr(self, offset);
-            let p = dword_at(self, at);
-            let word = self.s.m.load(self.cur, p);
             let c = self.cur;
-            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
+            let two = self.s.m.i32(2);
+            let index = self.s.m.bin(c, Bin::LShr, at, two);
+            let lds = self.s.lds();
+            let p = self.s.m.element(c, lds, index);
+            let word = self.s.m.load(c, p);
             let three = self.s.m.i32(3);
-            let off_in_word = self.s.m.bin(c, Bin::And, at, lane_mask);
+            let off_in_word = self.s.m.bin(c, Bin::And, at, three);
             let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
-            let raw = self.s.m.bin(c, Bin::LShr, word, shift);
+            let mut raw = self.s.m.bin(c, Bin::LShr, word, shift);
+            // A 16-bit read at byte 3 spans into the low byte of the next
+            // LDS dword (reads past the end of LDS see 0).
+            if bytes == 2 {
+                let one = self.s.m.i32(1);
+                let next_idx = self.s.m.bin(c, Bin::Add, index, one);
+                let limit = self.s.m.i32(self.s.lds_dwords);
+                let is_byte3 = self.s.m.cmp(c, pred::EQ, off_in_word, three);
+                let in_bounds = self.s.m.cmp(c, pred::IULT, next_idx, limit);
+                let spill = self.s.m.bin(c, Bin::And, is_byte3, in_bounds);
+                let zero = self.s.m.i32(0);
+                let step = self.begin_guarded(Some(spill));
+                let tc = self.cur;
+                let q = self.s.m.element(tc, lds, next_idx);
+                let hi = self.s.m.load(tc, q);
+                let (m8, k8) = (self.s.m.i32(0xFF), self.s.m.i32(8));
+                let hi = self.s.m.bin(tc, Bin::And, hi, m8);
+                let hi = self.s.m.bin(tc, Bin::Shl, hi, k8);
+                let hi = self.end_guarded(step, &[(hi, zero)])[0];
+                raw = self.s.m.bin(self.cur, Bin::Or, raw, hi);
+            }
+            let c = self.cur;
             let ext = if signed {
                 let k = self.s.m.i32(32 - 8 * bytes);
                 let hi = self.s.m.bin(c, Bin::Shl, raw, k);
@@ -2253,17 +2276,19 @@ impl<'a> Lower<'a> {
             };
             let mut val = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
             let at_bytes = byte_addr(self, offset);
-            let p = dword_at(self, at_bytes);
             let c = self.cur;
+            let two = self.s.m.i32(2);
+            let index = self.s.m.bin(c, Bin::LShr, at_bytes, two);
+            let lds = self.s.lds();
+            let p = self.s.m.element(c, lds, index);
             if hi_src {
                 let k16 = self.s.m.i32(16);
                 val = self.s.m.bin(c, Bin::LShr, val, k16);
             }
             let mask_val = self.s.m.i32(if bytes == 1 { 0xFF } else { 0xFFFF });
             let val = self.s.m.bin(c, Bin::And, val, mask_val);
-            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
             let three = self.s.m.i32(3);
-            let off_in_word = self.s.m.bin(c, Bin::And, at_bytes, lane_mask);
+            let off_in_word = self.s.m.bin(c, Bin::And, at_bytes, three);
             let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
             let shifted_mask = self.s.m.bin(c, Bin::Shl, mask_val, shift);
             let all_ones = self.s.m.i32(!0u32);
@@ -2271,14 +2296,34 @@ impl<'a> Lower<'a> {
             let shifted_val = self.s.m.bin(c, Bin::Shl, val, shift);
             // Atomic clear + set so concurrent lanes writing adjacent bytes or
             // halves within the same 32-bit dword do not race.
-            let at = self.begin_guarded(guard);
+            let outer = self.begin_guarded(guard);
             self.s
                 .m
                 .atomic(self.cur, super::bitcode::Rmw::And, p, clear_mask);
             self.s
                 .m
                 .atomic(self.cur, super::bitcode::Rmw::Or, p, shifted_val);
-            self.end_guarded(at, &[]);
+            if bytes == 2 {
+                let sc = self.cur;
+                let one = self.s.m.i32(1);
+                let next_idx = self.s.m.bin(sc, Bin::Add, index, one);
+                let limit = self.s.m.i32(self.s.lds_dwords);
+                let is_byte3 = self.s.m.cmp(sc, pred::EQ, off_in_word, three);
+                let in_bounds = self.s.m.cmp(sc, pred::IULT, next_idx, limit);
+                let spill = self.s.m.bin(sc, Bin::And, is_byte3, in_bounds);
+                let inner = self.begin_guarded(Some(spill));
+                let ic = self.cur;
+                let q = self.s.m.element(ic, lds, next_idx);
+                let k8 = self.s.m.i32(8);
+                let hi_val = self.s.m.bin(ic, Bin::LShr, val, k8);
+                let clear_low8 = self.s.m.i32(!0xFFu32);
+                self.s
+                    .m
+                    .atomic(ic, super::bitcode::Rmw::And, q, clear_low8);
+                self.s.m.atomic(ic, super::bitcode::Rmw::Or, q, hi_val);
+                self.end_guarded(inner, &[]);
+            }
+            self.end_guarded(outer, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -7468,9 +7513,9 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
             p: &p,

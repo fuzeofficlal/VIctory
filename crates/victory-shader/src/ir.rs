@@ -841,6 +841,10 @@ fn effects(
             }
             if let Some(d) = dst {
                 regs(d, &mut w)?;
+                // `_d16` and `_d16_hi` reads keep the destination's other half.
+                if name.starts_with("ds_read") && name.contains("_d16") {
+                    regs(d, &mut r)?;
+                }
             }
             if *gds
                 || name.starts_with("ds_gws")
@@ -1223,5 +1227,28 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn ds_read_d16_tracks_destination_as_read() {
+        let ds = |op: u32, addr: u32, data0: u32, dst: u32| -> [u32; 2] {
+            [
+                0xD800_0000 | (op << 18),
+                (dst << 24) | (data0 << 8) | addr,
+            ]
+        };
+        let mut words = vec![
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E08_0281, // v_mov_b32 v4, 1
+        ];
+        words.extend_from_slice(&ds(0x0a6, 0, 1, 4)); // ds_read_u16_d16 v4, v0
+        words.extend_from_slice(&ds(0x0a7, 0, 1, 4)); // ds_read_u16_d16_hi v4, v0
+        words.push(S_ENDPGM);
+        let p = build_words(&words, false);
+        let [_, preload, lo, hi, _] = &p.blocks[0].insts[..] else {
+            panic!()
+        };
+        assert_eq!(lo.read(Reg::V(4)), preload.write(Reg::V(4)));
+        assert_eq!(hi.read(Reg::V(4)), lo.write(Reg::V(4)));
     }
 }

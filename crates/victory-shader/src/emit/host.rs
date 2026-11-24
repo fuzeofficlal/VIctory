@@ -62,9 +62,28 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+fn enable_debug_once() {
+    #[cfg(test)]
+    if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+        static DEBUG: std::sync::Once = std::sync::Once::new();
+        DEBUG.call_once(|| {
+            let mut layer: Option<ID3D12Debug> = None;
+            // SAFETY: plain debug interface query before any device exists.
+            unsafe {
+                if D3D12GetDebugInterface(&mut layer).is_ok()
+                    && let Some(l) = layer
+                {
+                    l.EnableDebugLayer();
+                }
+            }
+        });
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
+        enable_debug_once();
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
@@ -566,6 +585,103 @@ pub struct Draw<'a> {
 
 #[cfg(test)]
 impl Host {
+    /// Every SM 6.6 hardware adapter on the machine, plus WARP.
+    pub fn all_adapters() -> Vec<(String, Self)> {
+        enable_debug_once();
+        let check_sm66 = |device: ID3D12Device| -> Option<Self> {
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            // SAFETY: valid feature query buffer.
+            let ok = unsafe {
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut sm).cast(),
+                        size_of_val(&sm) as u32,
+                    )
+                    .is_ok()
+            };
+            (ok && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0).then_some(Host { device })
+        };
+        let mut out = Vec::new();
+        // SAFETY: plain DXGI adapter enumeration and D3D12 device creation.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return out;
+            };
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..end]);
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device.and_then(check_sm66)
+                {
+                    out.push((name, dev));
+                }
+            }
+            if let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() {
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device.and_then(check_sm66)
+                {
+                    out.push(("WARP".into(), dev));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn clear_debug_messages(&self) {
+        if let Ok(iq) = self.device.cast::<ID3D12InfoQueue>() {
+            // SAFETY: plain info-queue clear on a live device.
+            unsafe { iq.ClearStoredMessages() };
+        }
+    }
+
+    pub fn take_debug_error(&self) -> Option<String> {
+        let iq = self.device.cast::<ID3D12InfoQueue>().ok()?;
+        let mut first = None;
+        // SAFETY: each message is read into a buffer of its reported byte size.
+        unsafe {
+            for i in 0..iq.GetNumStoredMessages() {
+                let mut len = 0;
+                if iq.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u64; len.div_ceil(8)];
+                let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if iq.GetMessage(i, Some(msg), &mut len).is_ok() {
+                    let m = &*msg;
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first.is_none() {
+                        let bytes =
+                            std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                        first = Some(
+                            String::from_utf8_lossy(bytes)
+                                .trim_end_matches('\0')
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            iq.ClearStoredMessages();
+        }
+        first
+    }
+
     /// Draws one triangle into an RGBA32F target and returns its texels.
     pub fn draw(
         &self,
