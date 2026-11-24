@@ -425,6 +425,12 @@ impl State {
         true
     }
 
+    /// An internal compute pass changed the host PSO and compute root signature.
+    pub(crate) fn invalidate_compute_binding(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+    }
+
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
@@ -1036,8 +1042,7 @@ impl State {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
+        self.invalidate_compute_binding();
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

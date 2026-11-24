@@ -436,6 +436,23 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+#[cfg(windows)]
+fn packed_transfer(
+    this: This,
+    dst: This,
+    record: impl FnOnce(&crate::host::HostList) -> bool,
+) -> bool {
+    let mut converted = false;
+    with_state(this, |list, state| {
+        converted = record(list);
+        if converted {
+            state.invalidate_compute_binding();
+            crate::texture::host_written(dst);
+        }
+    });
+    converted
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -448,6 +465,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
+            }
+            if let Some(format) = crate::resource::packed_copy_format(dst, src)
+                && packed_transfer(this, dst, |list| {
+                    crate::packed_copy::record(list, to, from, format, || {
+                        ensure_state(list, dst, COPY_DEST);
+                        ensure_state(list, src, COPY_SOURCE);
+                    })
+                })
+            {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| format!("copy packed resource {src:?} to {dst:?}"));
+                return;
             }
             if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
                 return;
@@ -618,6 +647,30 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
+            if dst.kind == 0
+                && src.kind == 0
+                && let Some(format) =
+                    crate::resource::packed_copy_format(dst.resource, src.resource)
+            {
+                // SAFETY: a non-null source box points at the six coordinates of the guest box.
+                let source_box = unsafe { source_box.cast::<D3D12_BOX>().as_ref() }.copied();
+                let region = crate::packed_copy::Region {
+                    src_subresource: src.footprint.offset as u32,
+                    dst_subresource: dst.footprint.offset as u32,
+                    offset: [x, y, z],
+                    source_box,
+                };
+                if packed_transfer(this, dst.resource, |list| {
+                    crate::packed_copy::record_region(list, to, texture, format, region, || {
+                        ensure_state(list, src.resource, COPY_SOURCE);
+                        ensure_state(list, dst.resource, COPY_DEST);
+                    })
+                }) {
+                    #[cfg(feature = "diagnostics")]
+                    list.note_op(|| format!("copy packed texture region {region:?}"));
+                    return;
+                }
+            }
             if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
                 return;
             }
@@ -684,6 +737,138 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+#[cfg(windows)]
+fn packed_resolve(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    src: This,
+    src_sub: u32,
+    logical: u32,
+) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::core::Interface;
+
+    let (Some(host), Some(to), Some(from)) = (
+        crate::host::host(),
+        crate::resource::host_resource(dst),
+        crate::resource::host_resource(src),
+    ) else {
+        return false;
+    };
+    // SAFETY: both host textures are live.
+    let (to_desc, from_desc) = unsafe { (to.GetDesc(), from.GetDesc()) };
+    if from_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || to_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || from_desc.SampleDesc.Count <= 1
+        || to_desc.SampleDesc.Count != 1
+    {
+        return false;
+    }
+    let (Some([src_w, src_h, _]), Some([dst_w, dst_h, _])) = (
+        crate::packed_copy::subresource_extent(&from_desc, src_sub),
+        crate::packed_copy::subresource_extent(&to_desc, dst_sub),
+    ) else {
+        return false;
+    };
+    let (resolve_w, resolve_h) = (src_w.min(dst_w), src_h.min(dst_h));
+    let cropped = (src_w, src_h) != (resolve_w, resolve_h);
+
+    packed_transfer(this, dst, |list| {
+        let list1 = if cropped {
+            let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() else {
+                return false;
+            };
+            Some(list1)
+        } else {
+            None
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let temp_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(resolve_w),
+            Height: resolve_h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: from_desc.Format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut temp: Option<ID3D12Resource> = None;
+        // SAFETY: default single-sample texture matching `from`'s physical format.
+        if unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &temp_desc,
+                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                None,
+                &mut temp,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+        let Some(temp) = temp else {
+            return false;
+        };
+
+        const RESOLVE_SOURCE: u32 = 0x2000;
+        ensure_state(list, src, RESOLVE_SOURCE);
+        // SAFETY: open direct list, live textures, `src` in RESOLVE_SOURCE,
+        // `temp` in RESOLVE_DEST, matching physical formats and extents.
+        unsafe {
+            if let Some(list1) = &list1 {
+                let rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: resolve_w as i32,
+                    bottom: resolve_h as i32,
+                };
+                list1.ResolveSubresourceRegion(
+                    &temp,
+                    0,
+                    0,
+                    0,
+                    from,
+                    src_sub,
+                    Some(&rect),
+                    from_desc.Format,
+                    D3D12_RESOLVE_MODE_AVERAGE,
+                );
+            } else {
+                list.list
+                    .ResolveSubresource(&temp, 0, from, src_sub, from_desc.Format);
+            }
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &temp,
+                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        list.keep(&temp);
+
+        let region = crate::packed_copy::Region {
+            src_subresource: 0,
+            dst_subresource: dst_sub,
+            offset: [0; 3],
+            source_box: None,
+        };
+        crate::packed_copy::record_region(list, to, &temp, logical, region, || {
+            ensure_state(list, dst, COPY_DEST);
+        })
+    })
+}
+
 extern "system" fn resolve(
     this: This,
     dst: This,
@@ -699,6 +884,13 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if let Some(logical) = crate::resource::packed_copy_format(dst, src)
+            && packed_resolve(this, dst, dst_sub, src, src_sub, logical)
+        {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("resolve packed {src:?} to {dst:?} format {logical}"));
+            return;
+        }
         if crate::resource::skip_mixed_packed_copy("ResolveSubresource", to, from) {
             return;
         }

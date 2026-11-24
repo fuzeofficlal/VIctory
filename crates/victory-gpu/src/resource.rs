@@ -520,6 +520,24 @@ pub(crate) fn pack_rgba8_to_16_rows(
     );
 }
 
+/// Packing format shared by a widened texture and one with native storage.
+#[cfg(windows)]
+pub(crate) fn packed_copy_format(to: This, from: This) -> Option<u32> {
+    let (to_host, from_host) = (host_resource(to)?, host_resource(from)?);
+    let format = pc_format(resource(to).desc.format);
+    if !PACKED_16.contains(&format) || pc_format(resource(from).desc.format) != format {
+        return None;
+    }
+    // SAFETY: both host resources are live.
+    let formats = unsafe {
+        (
+            to_host.GetDesc().Format.0 as u32,
+            from_host.GetDesc().Format.0 as u32,
+        )
+    };
+    (formats == (format, RGBA8_UNORM) || formats == (RGBA8_UNORM, format)).then_some(format)
+}
+
 /// Whether a GPU-to-GPU copy or resolve between `to` and `from` mixes a
 /// native packed 16-bit texture with a widened (or different) format, logging
 /// once per packed format so callers can skip the command before recording

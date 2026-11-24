@@ -33,6 +33,8 @@ mod host;
 mod indirect;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod packed_copy;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;

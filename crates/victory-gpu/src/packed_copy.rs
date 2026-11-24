@@ -1,0 +1,525 @@
+//! GPU copies between native packed color and its RGBA8 backing.
+
+use std::sync::OnceLock;
+
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows::core::{Error, s};
+
+use crate::host::{HostList, host, transition};
+
+const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0)"
+cbuffer Copy : register(b0) { uint width; uint src_pitch; uint dst_pitch; uint mode; };
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+
+// Match resource::unpack_16 and resource::pack_16.
+uint unpack(uint packed) {
+    uint4 rgba;
+    if ((mode & 255u) == 86u) {
+        rgba = uint4(packed >> 10, packed >> 5, packed, 0) & 31u;
+        rgba = (rgba << 3) | (rgba >> 2);
+        rgba.a = ((packed >> 15) & 1u) * 255u;
+    } else {
+        rgba = (uint4(packed >> 8, packed >> 4, packed, packed >> 12) & 15u) * 17u;
+    }
+    return rgba.r | (rgba.g << 8) | (rgba.b << 16) | (rgba.a << 24);
+}
+
+uint pack(uint word) {
+    uint4 rgba = uint4(word, word >> 8, word >> 16, word >> 24) & 255u;
+    if ((mode & 255u) == 86u) {
+        rgba = (rgba * uint4(31, 31, 31, 1) + 127u) / 255u;
+        return rgba.b | (rgba.g << 5) | (rgba.r << 10) | (rgba.a << 15);
+    }
+    rgba = (rgba * 15u + 127u) / 255u;
+    return rgba.b | (rgba.g << 4) | (rgba.r << 8) | (rgba.a << 12);
+}
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint x = 2u * id.x;
+    if (x >= width) return;
+    uint src_row = id.y * src_pitch;
+    uint dst_row = id.y * dst_pitch;
+    if (mode & 256u) {
+        uint pair = src.Load(src_row + 2u * x);
+        dst.Store(dst_row + 4u * x, unpack(pair & 65535u));
+        if (x + 1u < width) dst.Store(dst_row + 4u * x + 4u, unpack(pair >> 16));
+    } else {
+        uint pair = pack(src.Load(src_row + 4u * x));
+        if (x + 1u < width) pair |= pack(src.Load(src_row + 4u * x + 4u)) << 16;
+        // A single thread owns each dword, including the padding on odd widths.
+        dst.Store(dst_row + 2u * x, pair);
+    }
+}
+"#;
+
+struct Converter {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+}
+
+// SAFETY: D3D12 pipeline and root-signature objects are free-threaded.
+unsafe impl Send for Converter {}
+// SAFETY: as above.
+unsafe impl Sync for Converter {}
+
+fn converter(device: &ID3D12Device) -> Option<&'static Converter> {
+    static CONVERTER: OnceLock<Option<Converter>> = OnceLock::new();
+    CONVERTER
+        .get_or_init(|| match make_converter(device) {
+            Ok(converter) => Some(converter),
+            Err(error) => {
+                tracing::warn!(%error, "packed texture copy pipeline creation failed");
+                None
+            }
+        })
+        .as_ref()
+}
+
+fn make_converter(device: &ID3D12Device) -> windows::core::Result<Converter> {
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the shader source and names live through the call; out pointers are ours.
+    let compiled = unsafe {
+        D3DCompile(
+            SOURCE.as_ptr().cast(),
+            SOURCE.len(),
+            s!("packed_copy"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(error) = compiled {
+        if let Some(errors) = errors {
+            // SAFETY: the blob owns these bytes.
+            let message = unsafe {
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
+            };
+            tracing::warn!("{}", String::from_utf8_lossy(message));
+        }
+        return Err(error);
+    }
+    let code = code.ok_or_else(Error::empty)?;
+    // SAFETY: the blob owns the shader bytes and its embedded root signature.
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            },
+            ..Default::default()
+        })?;
+        Ok(Converter { root, pso })
+    }
+}
+
+fn footprints(
+    device: &ID3D12Device,
+    desc: &D3D12_RESOURCE_DESC,
+    count: u32,
+) -> Option<(Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, u64)> {
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut bytes = 0;
+    // SAFETY: the output array has room for all color subresources.
+    unsafe {
+        device.GetCopyableFootprints(
+            desc,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            None,
+            None,
+            Some(&mut bytes),
+        );
+    }
+    // The final odd-width packed row still needs a complete dword. An invalid
+    // description returns UINT64_MAX and fails the same addition.
+    let bytes = bytes.checked_add(3)? & !3;
+    Some((footprints, bytes))
+}
+
+fn buffer(
+    device: &ID3D12Device,
+    bytes: u64,
+    flags: D3D12_RESOURCE_FLAGS,
+    state: D3D12_RESOURCE_STATES,
+) -> windows::core::Result<ID3D12Resource> {
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+        ..Default::default()
+    };
+    let mut result = None;
+    // SAFETY: a committed default buffer with the requested state and flags.
+    unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            state,
+            None,
+            &mut result,
+        )?;
+    }
+    result.ok_or_else(Error::empty)
+}
+
+fn texture_location(texture: &ID3D12Resource, subresource: u32) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: subresource,
+        },
+    }
+}
+
+fn buffer_location(
+    buffer: &ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: footprint,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Region {
+    pub src_subresource: u32,
+    pub dst_subresource: u32,
+    pub offset: [u32; 3],
+    pub source_box: Option<D3D12_BOX>,
+}
+
+struct Surface<'a> {
+    texture: &'a ID3D12Resource,
+    first_subresource: u32,
+    layouts: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    bytes: u64,
+}
+
+impl<'a> Surface<'a> {
+    fn new(
+        device: &ID3D12Device,
+        texture: &'a ID3D12Resource,
+        desc: &D3D12_RESOURCE_DESC,
+        first_subresource: u32,
+        count: u32,
+    ) -> Option<Self> {
+        let (layouts, bytes) = footprints(device, desc, count)?;
+        Some(Self {
+            texture,
+            first_subresource,
+            layouts,
+            bytes,
+        })
+    }
+}
+
+fn is_texture(desc: &D3D12_RESOURCE_DESC) -> bool {
+    matches!(
+        desc.Dimension,
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D
+            | D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+    )
+}
+
+fn subresource_count(desc: &D3D12_RESOURCE_DESC) -> u32 {
+    let layers = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize)
+    };
+    u32::from(desc.MipLevels) * layers
+}
+
+/// Extent of a physical color subresource, in texels rather than bytes.
+pub(crate) fn subresource_extent(desc: &D3D12_RESOURCE_DESC, index: u32) -> Option<[u32; 3]> {
+    if !is_texture(desc) || index >= subresource_count(desc) {
+        return None;
+    }
+    let mip = index % u32::from(desc.MipLevels);
+    let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u32::from(desc.DepthOrArraySize)
+    } else {
+        1
+    };
+    Some([
+        ((desc.Width as u32) >> mip).max(1),
+        (desc.Height >> mip).max(1),
+        (depth >> mip).max(1),
+    ])
+}
+
+fn descriptions(
+    to: &ID3D12Resource,
+    from: &ID3D12Resource,
+    logical: u32,
+) -> Option<(D3D12_RESOURCE_DESC, D3D12_RESOURCE_DESC, u32)> {
+    if !matches!(logical, 86 | 115) {
+        return None;
+    }
+    // SAFETY: both resource interfaces are live.
+    let (src, dst) = unsafe { (from.GetDesc(), to.GetDesc()) };
+    if !is_texture(&src)
+        || !is_texture(&dst)
+        || src.SampleDesc.Count != 1
+        || dst.SampleDesc.Count != 1
+    {
+        return None;
+    }
+    let mode = match (src.Format.0 as u32, dst.Format.0 as u32) {
+        (packed, 28) if packed == logical => logical | 256,
+        (28, packed) if packed == logical => logical,
+        _ => return None,
+    };
+    Some((src, dst, mode))
+}
+
+fn region_desc(desc: &D3D12_RESOURCE_DESC, extent: [u32; 3]) -> D3D12_RESOURCE_DESC {
+    let [width, height, depth] = extent;
+    D3D12_RESOURCE_DESC {
+        Dimension: desc.Dimension,
+        Format: desc.Format,
+        Width: u64::from(width),
+        Height: height,
+        DepthOrArraySize: depth as u16,
+        MipLevels: 1,
+        SampleDesc: desc.SampleDesc,
+        ..Default::default()
+    }
+}
+
+/// Copies matching single-sample textures backed by two representations of
+/// the same logical format. After successful setup, prepare records the
+/// caller's transitions to COPY_SOURCE and COPY_DEST. A successful copy
+/// replaces the list's native compute root signature and pipeline.
+pub(crate) fn record(
+    list: &HostList,
+    to: &ID3D12Resource,
+    from: &ID3D12Resource,
+    logical: u32,
+    prepare: impl FnOnce(),
+) -> bool {
+    let Some((src, dst, mode)) = descriptions(to, from, logical) else {
+        return false;
+    };
+    if src.Dimension != dst.Dimension
+        || src.Width != dst.Width
+        || src.Height != dst.Height
+        || src.DepthOrArraySize != dst.DepthOrArraySize
+        || src.MipLevels != dst.MipLevels
+    {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    let device = &host.device;
+    let count = subresource_count(&src);
+    let (Some(src), Some(dst)) = (
+        Surface::new(device, from, &src, 0, count),
+        Surface::new(device, to, &dst, 0, count),
+    ) else {
+        return false;
+    };
+    write(list, device, src, dst, mode, [0; 3], None, prepare)
+}
+
+/// Copies a selected region using the same packed conversion as a whole copy.
+pub(crate) fn record_region(
+    list: &HostList,
+    to: &ID3D12Resource,
+    from: &ID3D12Resource,
+    logical: u32,
+    region: Region,
+    prepare: impl FnOnce(),
+) -> bool {
+    let Some((src, dst, mode)) = descriptions(to, from, logical) else {
+        return false;
+    };
+    let (Some(src_extent), Some(dst_extent)) = (
+        subresource_extent(&src, region.src_subresource),
+        subresource_extent(&dst, region.dst_subresource),
+    ) else {
+        return false;
+    };
+    let copy_extent = match region.source_box {
+        Some(b) => {
+            let start = [b.left, b.top, b.front];
+            let end = [b.right, b.bottom, b.back];
+            if (0..3).any(|i| start[i] >= end[i] || end[i] > src_extent[i]) {
+                return false;
+            }
+            std::array::from_fn(|i| end[i] - start[i])
+        }
+        None => src_extent,
+    };
+    if (0..3).any(|i| {
+        region.offset[i]
+            .checked_add(copy_extent[i])
+            .is_none_or(|end| end > dst_extent[i])
+    }) {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    let device = &host.device;
+    let (Some(src), Some(dst)) = (
+        Surface::new(
+            device,
+            from,
+            &region_desc(&src, copy_extent),
+            region.src_subresource,
+            1,
+        ),
+        Surface::new(
+            device,
+            to,
+            &region_desc(&dst, copy_extent),
+            region.dst_subresource,
+            1,
+        ),
+    ) else {
+        return false;
+    };
+    write(
+        list,
+        device,
+        src,
+        dst,
+        mode,
+        region.offset,
+        region.source_box,
+        prepare,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write(
+    list: &HostList,
+    device: &ID3D12Device,
+    source: Surface<'_>,
+    destination: Surface<'_>,
+    mode: u32,
+    [x, y, z]: [u32; 3],
+    source_box: Option<D3D12_BOX>,
+    prepare: impl FnOnce(),
+) -> bool {
+    let Some(converter) = converter(device) else {
+        return false;
+    };
+    let (Ok(input), Ok(output)) = (
+        buffer(
+            device,
+            source.bytes,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        ),
+        buffer(
+            device,
+            destination.bytes,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        ),
+    ) else {
+        return false;
+    };
+
+    prepare();
+    let native = &list.list;
+    let source_box = source_box.as_ref().map(std::ptr::from_ref);
+    // SAFETY: an open direct list. Locations are compatible with the native
+    // textures, the caller transitioned them, and all resources survive execution.
+    unsafe {
+        for (index, &footprint) in source.layouts.iter().enumerate() {
+            let to = buffer_location(&input, footprint);
+            let from = texture_location(source.texture, source.first_subresource + index as u32);
+            native.CopyTextureRegion(&to, 0, 0, 0, &from, source_box);
+        }
+        native.ResourceBarrier(&[transition(
+            &input,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )]);
+        native.SetComputeRootSignature(&converter.root);
+        native.SetPipelineState(&converter.pso);
+        let input_base = input.GetGPUVirtualAddress();
+        let output_base = output.GetGPUVirtualAddress();
+        for (input, output) in source.layouts.iter().zip(&destination.layouts) {
+            let src = input.Footprint;
+            let dst = output.Footprint;
+            let constants = [src.Width, src.RowPitch, dst.RowPitch, mode];
+            native.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+            // Bind one depth slice at a time so shader byte offsets fit in u32.
+            let src_slice = u64::from(src.RowPitch) * u64::from(src.Height);
+            let dst_slice = u64::from(dst.RowPitch) * u64::from(dst.Height);
+            for slice in 0..u64::from(src.Depth) {
+                native.SetComputeRootShaderResourceView(
+                    1,
+                    input_base + input.Offset + src_slice * slice,
+                );
+                native.SetComputeRootUnorderedAccessView(
+                    2,
+                    output_base + output.Offset + dst_slice * slice,
+                );
+                native.Dispatch(src.Width.div_ceil(128), src.Height, 1);
+            }
+        }
+        native.ResourceBarrier(&[transition(
+            &output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        for (index, &footprint) in destination.layouts.iter().enumerate() {
+            let to = texture_location(
+                destination.texture,
+                destination.first_subresource + index as u32,
+            );
+            let from = buffer_location(&output, footprint);
+            native.CopyTextureRegion(&to, x, y, z, &from, None);
+        }
+    }
+    list.keep(&input);
+    list.keep(&output);
+    list.keep(source.texture);
+    list.keep(destination.texture);
+    true
+}
