@@ -63,28 +63,17 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
-    pub fn new(warp: bool) -> Result<Self, String> {
-        let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    fn from_adapter(adapter: Option<&IDXGIAdapter>) -> Result<Self, String> {
+        // SAFETY: plain D3D12 calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
-            if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                let desc = adapter
-                    .cast::<IDXGIAdapter1>()
-                    .map_err(err)?
-                    .GetDesc1()
-                    .map_err(err)?;
-                // DXGI under Wine/DXVK may return the first hardware adapter for EnumWarpAdapter.
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                    return Err("WARP adapter is not a software adapter".to_string());
+            match adapter {
+                Some(a) => {
+                    D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
                 }
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                None => {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                }
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -105,6 +94,98 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    pub fn new(warp: bool) -> Result<Self, String> {
+        let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        if !warp {
+            return Self::from_adapter(None);
+        }
+        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+        unsafe {
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+            let desc = adapter
+                .cast::<IDXGIAdapter1>()
+                .map_err(err)?
+                .GetDesc1()
+                .map_err(err)?;
+            // DXGI under Wine/DXVK may return the first hardware adapter for EnumWarpAdapter.
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                return Err("WARP adapter is not a software adapter".to_string());
+            }
+            Self::from_adapter(Some(&adapter))
+        }
+    }
+
+    /// The DXGI adapter description for this device.
+    #[cfg(test)]
+    pub fn adapter_description(&self) -> String {
+        // SAFETY: plain D3D12/DXGI adapter query.
+        unsafe {
+            let luid = self.device.GetAdapterLuid();
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return "<unknown>".to_string();
+            };
+            let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+                return "<unknown>".to_string();
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                return "<unknown>".to_string();
+            };
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            String::from_utf16_lossy(&desc.Description[..end])
+        }
+    }
+
+    /// All SM 6.6+ hardware adapters enumerated by DXGI, plus WARP.
+    #[cfg(test)]
+    pub fn all_test_hosts() -> Vec<(String, bool, Host)> {
+        let mut hosts = Vec::new();
+        let mut seen = Vec::new();
+        // SAFETY: plain DXGI adapter enumeration and D3D12 device creation.
+        unsafe {
+            if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                let mut i = 0;
+                while let Ok(adapter1) = factory.EnumAdapters1(i) {
+                    i += 1;
+                    let Ok(desc) = adapter1.GetDesc1() else {
+                        continue;
+                    };
+                    if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                        continue;
+                    }
+                    let luid = (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart);
+                    if seen.contains(&luid) {
+                        continue;
+                    }
+                    let Ok(adapter) = adapter1.cast::<IDXGIAdapter>() else {
+                        continue;
+                    };
+                    if let Ok(host) = Self::from_adapter(Some(&adapter)) {
+                        seen.push(luid);
+                        let end = desc
+                            .Description
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.Description.len());
+                        let name = String::from_utf16_lossy(&desc.Description[..end]);
+                        hosts.push((name, false, host));
+                    }
+                }
+            }
+        }
+        if let Ok(warp) = Self::new(true) {
+            hosts.push((warp.adapter_description(), true, warp));
+        }
+        hosts
     }
 
     /// Wave-operation support and `(min, max)` hardware lane counts.
@@ -139,6 +220,21 @@ impl Host {
     pub fn supports_wave32(&self) -> bool {
         let (ops, min, max) = self.wave_lanes();
         ops && min <= 32 && max >= 32
+    }
+
+    /// Whether the host supports D3D12 mesh shaders (Tier 1+).
+    pub fn supports_mesh_shaders(&self) -> bool {
+        let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        // SAFETY: plain D3D12 feature query with valid struct size.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            )
+        }
+        .is_ok();
+        ok && opts.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
     }
 
     /// Best Wave64 compute lowering strategy supported by this host device.

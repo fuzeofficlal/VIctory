@@ -3166,15 +3166,24 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
+        if self.emulating_wave64() {
+            return self.ensure_wave_ids().1;
+        }
         if self.s.mesh.is_some() {
+            // Mesh shaders cannot declare WaveSize(64), so even on
+            // Wave64-capable RDNA hosts (WaveLaneCountMin=32, Max=64) the
+            // driver may run them in 32-lane waves under Wave64Mode::Native.
+            // Count and pick lanes the host's way whenever WaveSize(64) is not
+            // guaranteed, so masks and lane indices agree.
+            if self.x.native.wave64 && self.s.wave_size != Some(64) {
+                self.s.flags |= flags::WAVE_OPS;
+                return self.host_lane_index();
+            }
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
-        }
-        if self.emulating_wave64() {
-            return self.ensure_wave_ids().1;
         }
         self.host_lane_index()
     }
