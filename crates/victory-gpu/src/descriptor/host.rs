@@ -575,11 +575,12 @@ fn buffer_uav(
 /// concrete format). Returns `false` if the view format belongs to an incompatible
 /// family or cannot be created.
 pub(crate) fn adapt_view_format(
-    own: u32,
+    resource: &D3D12_RESOURCE_DESC,
     mut format: Option<&mut DXGI_FORMAT>,
     unordered: bool,
 ) -> bool {
     use crate::resource::{family, first_concrete, is_typeless};
+    let own = resource.Format.0 as u32;
     let typeless = is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
@@ -601,14 +602,23 @@ pub(crate) fn adapt_view_format(
         if !typeless {
             *format = DXGI_FORMAT(own as i32);
         } else if view == 0 || is_typeless(view) {
-            let concrete = first_concrete(own);
+            let concrete = match resource.Format {
+                // The shader view must identify the depth or stencil plane.
+                DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_R24G8_TYPELESS => return false,
+                DXGI_FORMAT_R16_TYPELESS
+                    if resource.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 =>
+                {
+                    DXGI_FORMAT_R16_UNORM
+                }
+                _ => DXGI_FORMAT(first_concrete(own) as i32),
+            };
             tracing::debug!(
                 own,
                 view,
-                concrete,
+                concrete = concrete.0,
                 "typeless view on typeless resource remapped to concrete format"
             );
-            *format = DXGI_FORMAT(concrete as i32);
+            *format = concrete;
         }
     }
     true
@@ -641,7 +651,7 @@ fn fits(texture: &ID3D12Resource, format: Option<&mut DXGI_FORMAT>, unordered: b
         );
         return false;
     }
-    adapt_view_format(own, format, unordered)
+    adapt_view_format(&d, format, unordered)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -997,50 +1007,114 @@ mod tests {
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 
-    /// Typeless SRV and UAV views on typeless resources are remapped to the first
-    /// concrete format of their family so D3D12 can create the view without E_INVALIDARG.
+    /// The color fallback supplies a concrete format while preserving an explicit
+    /// typed SRV and the linear conversion for an sRGB UAV.
     #[test]
     fn typeless_view_on_typeless_resource_remaps_to_concrete_format() {
+        let adapt = |format, view: Option<&mut DXGI_FORMAT>, unordered| {
+            adapt_view_format(
+                &D3D12_RESOURCE_DESC {
+                    Format: DXGI_FORMAT(format),
+                    ..Default::default()
+                },
+                view,
+                unordered,
+            )
+        };
         // R8G8B8A8_TYPELESS (27) with R8G8B8A8_TYPELESS view (27) -> R8G8B8A8_UNORM (28)
         let mut fmt = DXGI_FORMAT(27);
-        assert!(adapt_view_format(27, Some(&mut fmt), false));
+        assert!(adapt(27, Some(&mut fmt), false));
         assert_eq!(fmt.0, 28);
 
         // B8G8R8A8_TYPELESS (90) with B8G8R8A8_TYPELESS view (90) -> B8G8R8A8_UNORM (87)
         let mut fmt = DXGI_FORMAT(90);
-        assert!(adapt_view_format(90, Some(&mut fmt), false));
+        assert!(adapt(90, Some(&mut fmt), false));
         assert_eq!(fmt.0, 87);
 
         // R32_TYPELESS (39) with R32_TYPELESS view (39) -> R32_FLOAT (41)
         let mut fmt = DXGI_FORMAT(39);
-        assert!(adapt_view_format(39, Some(&mut fmt), false));
+        assert!(adapt(39, Some(&mut fmt), false));
         assert_eq!(fmt.0, 41);
 
         // UNKNOWN view (0) on typeless texture -> first concrete format
         let mut fmt = DXGI_FORMAT(0);
-        assert!(adapt_view_format(27, Some(&mut fmt), false));
+        assert!(adapt(27, Some(&mut fmt), false));
         assert_eq!(fmt.0, 28);
 
         // Typed view (29 = R8G8B8A8_UNORM_SRGB) on typeless texture (27) stays 29
         let mut fmt = DXGI_FORMAT(29);
-        assert!(adapt_view_format(27, Some(&mut fmt), false));
+        assert!(adapt(27, Some(&mut fmt), false));
         assert_eq!(fmt.0, 29);
 
         // Typeless view (27) on typed texture (28) adopts texture's format (28)
         let mut fmt = DXGI_FORMAT(27);
-        assert!(adapt_view_format(28, Some(&mut fmt), false));
+        assert!(adapt(28, Some(&mut fmt), false));
         assert_eq!(fmt.0, 28);
 
         // Typeless texture with None format is refused
-        assert!(!adapt_view_format(27, None, false));
+        assert!(!adapt(27, None, false));
 
         // Incompatible family is refused
         let mut fmt = DXGI_FORMAT(10);
-        assert!(!adapt_view_format(27, Some(&mut fmt), false));
+        assert!(!adapt(27, Some(&mut fmt), false));
 
         // UAV with sRGB (29) converts to linear (28)
         let mut fmt = DXGI_FORMAT(29);
-        assert!(adapt_view_format(27, Some(&mut fmt), true));
+        assert!(adapt(27, Some(&mut fmt), true));
         assert_eq!(fmt.0, 28);
+    }
+
+    #[test]
+    fn planar_depth_shader_views_require_a_readable_plane_format() {
+        for (format, readable) in [
+            (
+                DXGI_FORMAT_R32G8X24_TYPELESS,
+                [
+                    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+                ],
+            ),
+            (
+                DXGI_FORMAT_R24G8_TYPELESS,
+                [
+                    DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                    DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+                ],
+            ),
+        ] {
+            let resource = D3D12_RESOURCE_DESC {
+                Format: format,
+                ..Default::default()
+            };
+            for mut inferred in [DXGI_FORMAT_UNKNOWN, format] {
+                assert!(!adapt_view_format(&resource, Some(&mut inferred), false));
+            }
+            for typed in readable {
+                let mut requested = typed;
+                assert!(adapt_view_format(&resource, Some(&mut requested), false));
+                assert_eq!(requested, typed);
+            }
+        }
+    }
+
+    #[test]
+    fn r16_typeless_shader_view_distinguishes_depth_from_color() {
+        let mut resource = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        for (flags, expected) in [
+            (
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                DXGI_FORMAT_R16_UNORM,
+            ),
+            (D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R16_FLOAT),
+        ] {
+            resource.Flags = flags;
+            let mut requested = DXGI_FORMAT_R16_TYPELESS;
+            assert!(adapt_view_format(&resource, Some(&mut requested), false));
+            assert_eq!(requested, expected);
+        }
     }
 }
