@@ -648,6 +648,35 @@ fn texel_offsets_and_levels_sample_the_texels_they_name() {
             ([0, f(u), f(v)].to_vec(), texel(n, (u, v), (1, -1)))
         }),
         case(
+            "o (a16)",
+            Mimg {
+                a16: true,
+                ..mimg("image_sample_o", 0xF)
+            },
+            &[(2, ow(1, -1))],
+            |l| {
+                let ((u, v), n) = quad_lane(l);
+                let uv = half(u) | half(v) << 16;
+                (vec![0, uv], texel(n, (u, v), (1, -1)))
+            },
+        ),
+        case(
+            "b (a16)",
+            Mimg {
+                a16: true,
+                ..mimg("image_sample_b", 0xF)
+            },
+            &[],
+            |l| {
+                let ((u, v), n) = quad_lane(l);
+                let bias = (l / 4 % 2) as u32;
+                // The low half holds the bias. The high half must be ignored.
+                let bias_word = half(bias as f32) | 0x7e00_0000;
+                let uv = half(u) | half(v) << 16;
+                (vec![bias_word, uv], texel(n + bias, (u, v), (0, 0)))
+            },
+        ),
+        case(
             "b_o",
             mimg("image_sample_b_o", 0xF),
             &[(2, ow(0, 2))],
