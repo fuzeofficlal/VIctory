@@ -289,53 +289,48 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
-/// The barrier on host resources, or `None` if it names a resource the host
-/// GPU does not have (buffers so far).
+/// Appends the host barriers for this title barrier.
 #[cfg(windows)]
-fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
+fn host_barrier(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<Barrier>) {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let host = |r: This| {
+        if r.is_null() {
+            Some(r)
+        } else {
+            crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast())
+        }
+    };
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
             const BEGIN_ONLY: u32 = 1;
             if b.flags & BEGIN_ONLY != 0 {
-                return None;
+                return;
             }
-            // shortcut: whole resources, from the state the list tracked
-            // (`HostList::transition`); subresources are not told apart.
+            let Some(copy) = crate::resource::host_copy(b.first) else {
+                return;
+            };
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
-            Some(Barrier {
-                kind: 0,
-                flags: 0,
-                first: texture.as_raw().cast_const().cast(),
-                second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
-            })
+            list.transition(copy, b.second as u32, wanted, |texture, index, before, after| {
+                out.push(Barrier {
+                    kind: 0,
+                    flags: 0,
+                    first: texture.as_raw().cast_const().cast(),
+                    second: u64::from(index) | (u64::from(before) << 32),
+                    last: u64::from(after),
+                });
+            });
         }
-        1 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            second: if b.second == 0 {
-                0
-            } else {
-                host(b.second as This)? as u64
-            },
-            ..*b
-        }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            ..*b
-        }),
-        _ => None,
+        1 | 2 => {
+            let Some(first) = host(b.first) else { return };
+            let mut translated = Barrier { first, ..*b };
+            if b.kind == 1 {
+                let Some(second) = host(b.second as This) else { return };
+                translated.second = second as u64;
+            }
+            out.push(translated);
+        }
+        _ => {}
     }
 }
 
@@ -357,10 +352,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut host = Vec::new();
+        for b in barriers {
+            host_barrier(list, b, &mut host);
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -389,13 +384,32 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
-    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
-        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    ensure_subresource_state(list, resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state);
+}
+
+/// Moves a single host subresource, or the whole texture, to `state`.
+#[cfg(windows)]
+pub(crate) fn ensure_subresource_state(
+    list: &crate::host::HostList,
+    resource: This,
+    subresource: u32,
+    state: u32,
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES;
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    list.transition(copy, subresource, state, |texture, index, before, after| {
+        let barrier = crate::host::transition_subresource(
+            texture,
+            index,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(after as i32),
+        );
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
-    }
+    });
 }
 
 #[cfg(windows)]
@@ -478,6 +492,14 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+#[cfg(windows)]
+impl CopyLocation {
+    fn subresource(&self) -> u32 {
+        // The subresource index is the first 32 bits of the union.
+        self.footprint.offset as u32
+    }
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -535,10 +557,10 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            ensure_state(list, src.resource, COPY_SOURCE);
+            ensure_subresource_state(list, src.resource, src.subresource(), COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
-        ensure_state(list, dst.resource, COPY_DEST);
+        ensure_subresource_state(list, dst.resource, dst.subresource(), COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -621,8 +643,8 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        ensure_state(list, dst, RESOLVE_DEST);
-        ensure_state(list, src, RESOLVE_SOURCE);
+        ensure_subresource_state(list, dst, dst_sub, RESOLVE_DEST);
+        ensure_subresource_state(list, src, src_sub, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
@@ -695,17 +717,10 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        ensure_state(list, record.resource, RENDER_TARGET);
         let rtv = host.rtv(texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
-            }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
