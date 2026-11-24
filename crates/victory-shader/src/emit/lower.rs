@@ -566,6 +566,32 @@ fn ms_counts_plan(
     })
 }
 
+/// Component-wise maxima when every planned request writes a literal M0.
+/// A runtime operand or a merged definition leaves the declaration unchanged.
+fn literal_request_maxima(p: &Program, sites: &[(usize, usize)]) -> Option<(u32, u32)> {
+    let mut vertices = 0;
+    let mut primitives = 0;
+    for &(b, i) in sites {
+        let value = p.blocks[b].insts[i].read(Reg::S(crate::ir::M0))?;
+        let def = p
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find(|inst| inst.write(Reg::S(crate::ir::M0)) == Some(value))?;
+        let Fields::Sop { src, imm, .. } = &def.fields else {
+            return None;
+        };
+        let packed = match def.name() {
+            "s_mov_b32" => literal_operand(src.first()?)?,
+            "s_movk_i32" => i32::from((*imm)? as i16) as u32,
+            _ => return None,
+        };
+        vertices = vertices.max(packed & 0xfff);
+        primitives = primitives.max((packed >> 12) & 0xfff);
+    }
+    Some((vertices, primitives))
+}
+
 /// Immediate post-dominator per block (or virtual exit `n`) using Cooper-Harvey-Kennedy.
 /// Unreachable or never-exiting blocks have `rev_idx == usize::MAX`.
 fn compute_postdoms(n: usize, succs: &[Vec<usize>], fwd: &[bool]) -> (Vec<usize>, Vec<usize>) {
@@ -874,7 +900,7 @@ fn collect_cross_block_masks(
     out
 }
 
-fn operand_const_lane(op: &Operand) -> Option<u32> {
+fn literal_operand(op: &Operand) -> Option<u32> {
     match *op {
         Operand::Const(c) => crate::resource::inline(c),
         Operand::Literal(x) => Some(x),
@@ -3398,7 +3424,9 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let is0 = self.s.m.cmp(self.cur, pred::EQ, flat, zero);
-        let at = self.begin_guarded(Some(is0));
+        let has_vertices = self.s.m.cmp(self.cur, pred::NE, v, zero);
+        let initialize = self.s.m.bin(self.cur, Bin::And, is0, has_vertices);
+        let at = self.begin_guarded(Some(initialize));
         let idv = self.s.m.i32(id as u32);
         let cols = self.s.outputs[id].cols.min(4);
         for ch in 0..cols {
@@ -3448,10 +3476,22 @@ impl<'a> Lower<'a> {
         if !fits(mesh) {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
-            // shortcut: outputs that pass the cap even at the lane count are
-            // still emitted, as before, with the lower maxima: drivers have
-            // been seen to take such modules, and refusing them would drop
-            // draws that may work today.
+            if !fits(mesh)
+                && let Some((vertices, primitives)) = self.ms.as_ref().and_then(|plan| {
+                    literal_request_maxima(self.x.p, &plan.sites)
+                })
+            {
+                // These maxima still cover every count the plan can apply.
+                let capped = super::shader::Mesh {
+                    max_vertices: mesh.max_vertices.min(vertices.max(1)),
+                    max_primitives: mesh.max_primitives.min(primitives.max(1)),
+                    ..mesh
+                };
+                if fits(capped) {
+                    mesh = capped;
+                }
+            }
+            // shortcut: outputs still over the cap are emitted as before.
         }
         self.s.mesh = Some(mesh);
         if self.ms.is_some() {
@@ -5616,7 +5656,7 @@ impl<'a> Lower<'a> {
                 }
                 if self.wave64 == Wave64Mode::Wave32
                     && self.total_threads <= 32
-                    && let Some(op_lane) = v.src.get(1).and_then(operand_const_lane)
+                    && let Some(op_lane) = v.src.get(1).and_then(literal_operand)
                     && op_lane >= 32
                 {
                     return Err("a lane >= 32 read in a <=32-thread dispatch");
@@ -8285,6 +8325,27 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn mesh_literal_bound_covers_all_requests_or_keeps_the_declaration() {
+        for (second, expected) in [
+            (&[0xBEFC_03FFu32, 0x3028][..], Some((96, 3))), // s_mov_b32 m0, (40 | 3 << 12)
+            (&[0xBEFC_0308u32][..], None),                  // s_mov_b32 m0, s8
+        ] {
+            let mut words = vec![
+                0xB07C_1060u32, // s_movk_i32 m0, (96 | 1 << 12)
+                0xBF90_0009,    // s_sendmsg GS_ALLOC_REQ
+            ];
+            words.extend_from_slice(second);
+            words.extend([0xBF90_0009, S_ENDPGM]);
+            let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let program = ir::build(&bytes, true, 32).unwrap();
+            assert_eq!(
+                super::literal_request_maxima(&program, &[(0, 1), (0, 3)]),
+                expected,
+            );
+        }
+    }
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
