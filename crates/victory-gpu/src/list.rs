@@ -698,6 +698,7 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
             return;
@@ -718,8 +719,22 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let desc = record.desc();
-        let subresource = crate::descriptor::rtv_subresource(texture, desc.as_ref());
-        ensure_subresource_state(list, record.resource, subresource, RENDER_TARGET);
+        if let Some(desc) = &desc
+            && desc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+        {
+            // SAFETY: the view dimension selects this union member; the texture is live.
+            let (view, resource_desc) = unsafe { (desc.Anonymous.Texture2DArray, texture.GetDesc()) };
+            let mips = u32::from(resource_desc.MipLevels);
+            let slices = u32::from(resource_desc.DepthOrArraySize);
+            let plane_offset = view.PlaneSlice * mips * slices;
+            for slice in (view.FirstArraySlice..slices).take(view.ArraySize as usize) {
+                let subresource = view.MipSlice + slice * mips + plane_offset;
+                ensure_subresource_state(list, record.resource, subresource, RENDER_TARGET);
+            }
+        } else {
+            let subresource = crate::descriptor::rtv_subresource(texture, desc.as_ref());
+            ensure_subresource_state(list, record.resource, subresource, RENDER_TARGET);
+        }
         let rtv = host.rtv(texture, desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
