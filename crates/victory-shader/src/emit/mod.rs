@@ -580,6 +580,177 @@ mod tests {
         s.finish()
     }
 
+    /// A legacy GS can append its final vertex in the done message.
+    #[test]
+    #[cfg(windows)]
+    fn legacy_geometry_shader_emits_the_vertex_in_the_done_message() {
+        use super::host::{Draw, Host};
+        use super::valu_tests::{ONE_AT_A_TIME, vop3};
+        use crate::native::{GeometryIo, Usage, VsInput, VsOutput};
+
+        let to_code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let stage = |stage, io, words: &[u32]| NativeProgram {
+            stage,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![],
+            used: vec![],
+            io,
+            code: to_code(words),
+        };
+        let signature_element = |name: &str, kind| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let position = signature_element("SV_Position", 3);
+        let translate = |native: NativeProgram, input: SigElement| {
+            let isg1 = container::signature(&[input], true);
+            let osg1 = container::signature(std::slice::from_ref(&position), false);
+            let container = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&container).unwrap();
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap()
+        };
+        let own_ring = [
+            vop3(0x365, 4, 193, 128, 0),   // v_mbcnt_lo_u32_b32 v4, -1, 0
+            vop3(0x366, 4, 193, 260, 0),   // v_mbcnt_hi_u32_b32 v4, -1, v4
+            vop3(0x346, 4, 260, 134, 128), // v_lshl_add_u32 v4, v4, 6, 0
+        ]
+        .concat();
+        const WRITE_B128: u32 = 0xDB7C_0000;
+        const READ_B128: u32 = 0xDBFC_0000;
+        const WAIT_LDS: u32 = 0xBF8C_C07F;
+        const END: u32 = 0xBF81_0000;
+        const EMIT: u32 = 0xBF90_0022;
+        const EMIT_CUT: u32 = 0xBF90_0032;
+        const DONE: u32 = 0xBF90_0003;
+        const DONE_EMIT_CUT: u32 = 0xBF90_0033;
+
+        let mut es_words = own_ring.clone();
+        es_words.extend([WRITE_B128, 0x0000_0C04, WAIT_LDS, END]);
+        let vs = translate(
+            stage(
+                HwStage::Es,
+                StageIo::Vs {
+                    inputs: vec![VsInput {
+                        usage: Usage::Generic,
+                        row: 0,
+                        mask: 15,
+                        vgpr: 12,
+                    }],
+                    outputs: vec![VsOutput {
+                        usage: Usage::Generic,
+                        row: 0,
+                        param: 0,
+                        fp16: false,
+                        pack2: false,
+                    }],
+                },
+                &es_words,
+            ),
+            signature_element("POSITION", 0),
+        );
+        let ps = HostShader {
+            stage: HwStage::Ps,
+            dxil: constant_color(),
+            user_data: vec![],
+            samplers: vec![],
+            static_samplers: vec![],
+            root_cbvs: vec![],
+            root_srvs: vec![],
+        };
+
+        let mut gs_words = own_ring;
+        // ESGS vertex indices 0, 1, 2 are respectively v0.lo, v0.hi, v1.lo.
+        for (vertex, (packed, half)) in [(256, 128), (256, 144), (257, 128)].into_iter().enumerate()
+        {
+            gs_words.extend(vop3(0x148, 10, packed, half, 144)); // v_bfe_u32
+            gs_words.push(0x3414_1482); // v_lshlrev_b32 v10, 2, v10
+            gs_words.extend([READ_B128, 0x0C00_000A, WAIT_LDS]);
+            gs_words.extend([WRITE_B128 | (vertex as u32 * 16), 0x0000_0C04, WAIT_LDS]);
+            if vertex < 2 {
+                gs_words.push(EMIT);
+            }
+        }
+        let make_gs = |ending: &[u32]| {
+            let mut words = gs_words.clone();
+            words.extend_from_slice(ending);
+            words.push(END);
+            translate(
+                stage(
+                    HwStage::Gs,
+                    StageIo::Gs(GeometryIo {
+                        copy_code: to_code(&[
+                            READ_B128,
+                            0x0400_0000,
+                            WAIT_LDS,
+                            0xF800_08CF,
+                            0x0706_0504, // exp pos0, v4..v7 done
+                            END,
+                        ]),
+                        copy_outputs: vec![],
+                        max_vertices: 3,
+                        vertex_dwords: 4,
+                    }),
+                    &words,
+                ),
+                position.clone(),
+            )
+        };
+        let separate = make_gs(&[EMIT_CUT, DONE]);
+        let fused = make_gs(&[DONE_EMIT_CUT]);
+        if let Ok(mut validator) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            for shader in [&vs, &separate, &fused] {
+                validator.validate(&mut shader.dxil.clone()).unwrap();
+            }
+        }
+
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = false;
+        for (backend, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {backend} device; skipped");
+                continue;
+            };
+            for (ending, shader) in [("separate", &separate), ("fused", &fused)] {
+                let (root, pso) = host.geometry_pipeline(&vs, shader, &ps).unwrap();
+                let pixels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[
+                                -1.0, -1.0, 0.5, 1.0, -1.0, 3.0, 0.5, 1.0, 3.0, -1.0, 0.5, 1.0,
+                            ],
+                            stride: 16,
+                            size: (4, 4),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(pixels, [[1.0, 0.5, 0.25, 1.0]; 16], "{backend}: {ending}");
+            }
+            ran = true;
+        }
+        assert!(ran, "neither hardware nor WARP SM 6.6 device available");
+    }
+
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {

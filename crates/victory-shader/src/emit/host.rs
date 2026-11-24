@@ -823,6 +823,7 @@ impl Host {
                     Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,

@@ -6883,10 +6883,8 @@ impl<'a> Lower<'a> {
     /// export from the GSVS ring and emits it; GS_OP_CUT ends the strip.
     fn gs_message(&mut self, imm: u16) -> Result<(), Why> {
         let (msg, op, stream) = (imm & 0xF, imm >> 4 & 3, imm >> 8 & 3);
-        if msg == MSG_GS_DONE {
-            return Ok(());
-        }
-        if msg != MSG_GS {
+        // GS_DONE can carry the same emit and cut operations as GS.
+        if !matches!(msg, MSG_GS | MSG_GS_DONE) {
             return Err("a GS message");
         }
         if stream != 0 {
