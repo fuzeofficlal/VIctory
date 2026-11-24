@@ -229,21 +229,21 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
-/// Clears journal and guard entries for a freed test allocation so address
-/// reuse across tests in the same process does not report stale writes.
-#[cfg(test)]
+/// Clears journal and guard entries for whole 64 KiB pages inside `[start,
+/// end)` before an owned allocation is returned to the system so virtual
+/// address reuse does not report stale writes.
 pub(crate) fn forget_pages(start: usize, end: usize) {
-    if start >= end {
+    let (first, last) = (start.div_ceil(PAGE), end / PAGE);
+    if first >= last {
         return;
     }
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let stale: Vec<usize> = j.written.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
         j.written.remove(&page);
     }
     drop(j);
-    title_memory_remapped(start, end - start);
+    title_memory_remapped(first * PAGE, (last - first) * PAGE);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -339,6 +339,41 @@ mod tests {
             )
             .is_none()
         );
+        forget_pages(start, end);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn freed_allocations_forget_whole_pages_before_reuse() {
+        // SAFETY: a fresh write-watched allocation of 3 pages, freed below.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                3 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // SAFETY: committed pages of ours.
+        unsafe {
+            (p as *mut u8).write(0x11);
+            ((p + PAGE) as *mut u8).write(0x22);
+            ((p + 2 * PAGE) as *mut u8).write(0x33);
+        }
+        let (now, dirty) = writes(p, p + 3 * PAGE, false).expect("watched");
+        assert_eq!(
+            dirty,
+            [(p / PAGE, now), (p / PAGE + 1, now), (p / PAGE + 2, now)]
+        );
+        // Sub-page edges stay intact; only the middle whole page is forgotten.
+        forget_pages(p + 4096, p + 2 * PAGE + 4096);
+        let (_, remaining) = writes(p, p + 3 * PAGE, false).expect("watched");
+        assert_eq!(remaining, [(p / PAGE, now), (p / PAGE + 2, now)]);
+        forget_pages(p, p + 3 * PAGE);
+        let (_, cleared) = writes(p, p + 3 * PAGE, false).expect("watched");
+        assert!(cleared.is_empty());
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -382,10 +417,8 @@ mod tests {
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
-            b"from the disk"
-        );
+        let got = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
+        assert_eq!(got, b"from the disk");
         assert_eq!(
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())

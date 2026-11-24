@@ -655,6 +655,11 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            let start = self.ptr.as_ptr() as usize;
+            crate::watch::forget_pages(start, start.saturating_add(self.layout.size()));
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.

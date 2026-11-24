@@ -281,25 +281,34 @@ impl Shadow {
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
                 }
-                // Only mark the page synced if title memory and VRAM now match
-                // byte for byte; if the title concurrently wrote other bytes on
-                // this page, leave it dirty so the next refresh uploads them.
-                if !cpu_diff {
+                // Only mark a whole page synced if title memory and VRAM now match
+                // byte for byte; partial edge pieces or pages with concurrent CPU
+                // writes stay dirty so the next refresh uploads them.
+                if !cpu_diff && n == PAGE {
                     synced.push((start + at) / PAGE);
                 }
             }
             at += n;
         }
-        let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-        if first < last
-            && !synced.is_empty()
-            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-            && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-        {
+        if !synced.is_empty() && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let base = start / PAGE;
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                copied[page - base] = now;
+            let mut i = 0;
+            while i < synced.len() {
+                let run_first = synced[i];
+                let mut run_last = run_first + 1;
+                while i + 1 < synced.len() && synced[i + 1] == run_last {
+                    i += 1;
+                    run_last += 1;
+                }
+                i += 1;
+                if let Some((now, _)) =
+                    crate::watch::writes(run_first * PAGE, run_last * PAGE, true)
+                {
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    for page in run_first..run_last {
+                        copied[page - base] = now;
+                    }
+                }
             }
         }
         written
@@ -647,11 +656,14 @@ mod tests {
     impl Drop for WatchedAlloc {
         fn drop(&mut self) {
             unregister(self.resource_id, self.addr());
+            // Clear watch journal and guard entries while we still own the
+            // virtual address range, before another thread can reuse it.
+            crate::watch::forget_pages(
+                self.ptr as usize,
+                (self.ptr as usize).saturating_add(self.len),
+            );
             // SAFETY: frees the allocation obtained from VirtualAlloc.
             unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
-            // Clear watch journal entries for the freed virtual address range so
-            // subsequent tests that reuse the address start clean.
-            crate::watch::forget_pages(self.ptr as usize, self.ptr as usize + self.len);
         }
     }
 
@@ -1000,5 +1012,259 @@ mod tests {
             .map(|u| (u.dst_offset, u.len, u.src_offset))
             .collect();
         assert_eq!(b_ranges, vec![(0, 128, 0)]);
+    }
+
+    #[test]
+    fn default_vram_multi_submission_compute_uav_and_overlap_roundtrip() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+            D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_ID,
+            D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_INVALIDLIBRARYBLOB, D3D12_MESSAGE_SEVERITY,
+            D3D12_MESSAGE_SEVERITY_ERROR, D3D12_SHADER_BYTECODE, ID3D12InfoQueue1,
+            ID3D12PipelineState, ID3D12RootSignature,
+        };
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+        use windows::core::{Interface, PCSTR, s};
+
+        static DEBUG_ERRORS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn on_debug_message(
+            _: D3D12_MESSAGE_CATEGORY,
+            severity: D3D12_MESSAGE_SEVERITY,
+            id: D3D12_MESSAGE_ID,
+            desc: PCSTR,
+            _: *mut std::ffi::c_void,
+        ) {
+            // `pipeline::library::tests::a_rejected_blob_gives_an_empty_library`
+            // intentionally feeds an invalid blob on the shared device in parallel.
+            if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                && id != D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_INVALIDLIBRARYBLOB
+            {
+                DEBUG_ERRORS.fetch_add(1, AtomicOrdering::Relaxed);
+                // SAFETY: D3D12 passes a valid NUL-terminated description for the callback.
+                let msg = unsafe { desc.to_string() }.unwrap_or_default();
+                eprintln!("D3D12 debug error (id={}): {msg}", id.0);
+            }
+        }
+
+        struct DebugCallback(Option<(ID3D12InfoQueue1, u32)>);
+        impl Drop for DebugCallback {
+            fn drop(&mut self) {
+                if let Some((ref q, cookie)) = self.0 {
+                    // SAFETY: unregisters the cookie registered on this queue.
+                    let _ = unsafe { q.UnregisterMessageCallback(cookie) };
+                }
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        DEBUG_ERRORS.store(0, AtomicOrdering::Relaxed);
+        let _debug_cb = DebugCallback(host.device.cast::<ID3D12InfoQueue1>().ok().and_then(|q| {
+            let mut cookie = 0;
+            // SAFETY: static callback function, unregistered on drop.
+            unsafe {
+                q.RegisterMessageCallback(
+                    Some(on_debug_message),
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+            }
+            .ok()
+            .map(|()| (q, cookie))
+        }));
+
+        // SAFETY: plain DXGI adapter lookup for diagnostic logging.
+        if let Ok(desc) = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+        } {
+            eprintln!(
+                "shadow roundtrip adapter: {} ({:04x}:{:04x}, flags={:#x})",
+                String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'),
+                desc.VendorId,
+                desc.DeviceId,
+                desc.Flags
+            );
+        }
+
+        const SHADER: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
+cbuffer Mode : register(b0) { uint pass_idx; uint page_bytes; };
+ByteAddressBuffer src_buf : register(t0);
+RWByteAddressBuffer dst_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    if (pass_idx == 0) {
+        uint a = src_buf.Load(0);
+        uint b = src_buf.Load(64);
+        dst_buf.Store(0, a ^ 0x0F0F0F0Fu);
+        dst_buf.Store(page_bytes, b + 0x11111111u);
+    } else {
+        uint gpu_prev = dst_buf.Load(0);
+        uint cpu_concurrent = dst_buf.Load(32);
+        uint page1_prev = dst_buf.Load(page_bytes);
+        dst_buf.Store(16, (gpu_prev ^ cpu_concurrent) + page1_prev);
+    }
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static HLSL source and valid output blob pointer.
+        unsafe {
+            D3DCompile(
+                SHADER.as_ptr().cast(),
+                SHADER.len(),
+                s!("shadow_roundtrip"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("compile synthetic compute shader");
+        let code = code.expect("shader blob");
+        // SAFETY: valid compiled DXBC bytecode with embedded root signature.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let mut src_mem = WatchedAlloc::new(PAGE, 0x5000_0010);
+        let mut staging_patch = WatchedAlloc::new(PAGE, 0x5000_0011);
+        let mut dst_mem = WatchedAlloc::new(2 * PAGE, 0x5000_0012);
+        src_mem.bytes_mut().fill(0);
+        staging_patch.bytes_mut().fill(0);
+        dst_mem.bytes_mut().fill(0);
+
+        // Initial values in src_mem, plus a submission-time Copy overwrite at [0..4)
+        // so one submission exercises overlapping UploadCopy trimming on the GPU.
+        src_mem.bytes_mut()[0..4].copy_from_slice(&0xAAAA_0000u32.to_le_bytes());
+        src_mem.bytes_mut()[64..68].copy_from_slice(&0x2222_3333u32.to_le_bytes());
+        staging_patch.bytes_mut()[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        dst_mem.bytes_mut()[12..16].copy_from_slice(&0x7788_99AAu32.to_le_bytes());
+
+        let src_shadow = find(src_mem.addr(), PAGE as u64).expect("src shadow");
+        let dst_shadow = find(dst_mem.addr(), (2 * PAGE) as u64).expect("dst shadow");
+
+        // Submission 1:
+        // - Refresh src_shadow, overwrite src_mem[0..4) via defer_copy, refresh again
+        //   (overlapping upload in one prelude; GPU must see 0x1234_5678, not 0xAAAA_0000).
+        // - Refresh dst_shadow (2 pages) and mark all 2 pages as gpu_writes.
+        // - Simulate a concurrent CPU write to dst_mem[32..36) on page 0 while page 1
+        //   only receives a GPU write.
+        let list = host.new_list().expect("new list");
+        list.keep(&root);
+        list.keep(&pso);
+        src_shadow.refresh(&list, src_mem.addr(), PAGE as u64);
+        list.defer_copy(
+            src_mem.addr() as *mut u8,
+            staging_patch.addr() as *const u8,
+            4,
+        );
+        src_shadow.refresh(&list, src_mem.addr(), 64);
+        dst_shadow.refresh(&list, dst_mem.addr(), (2 * PAGE) as u64);
+        dst_shadow.gpu_writes(&list, dst_mem.addr(), (2 * PAGE) as u64);
+        let concurrent_dst = (dst_mem.addr() as usize) + 32;
+        list.defer_host(move || {
+            // SAFETY: 4-byte aligned slot inside `dst_mem`, disjoint from GPU writes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    0xCAFE_F00Du32.to_le_bytes().as_ptr(),
+                    concurrent_dst as *mut u8,
+                    4,
+                );
+            }
+        });
+        let pass0 = [0u32, PAGE as u32];
+        // SAFETY: open command list with live pipeline and default-heap shadow buffers.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRoot32BitConstants(0, 2, pass0.as_ptr().cast(), 0);
+            list.list
+                .SetComputeRootShaderResourceView(1, src_shadow.gpu(src_mem.addr()));
+            list.list
+                .SetComputeRootUnorderedAccessView(2, dst_shadow.gpu(dst_mem.addr()));
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let word =
+            |buf: &[u8], off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let expected_p0 = 0x1234_5678u32 ^ 0x0F0F_0F0Fu32;
+        let expected_p1 = 0x2222_3333u32.wrapping_add(0x1111_1111u32);
+        assert_eq!(word(dst_mem.bytes_mut(), 0), expected_p0);
+        assert_eq!(word(dst_mem.bytes_mut(), 12), 0x7788_99AA);
+        assert_eq!(word(dst_mem.bytes_mut(), 32), 0xCAFE_F00D);
+        assert_eq!(word(dst_mem.bytes_mut(), PAGE), expected_p1);
+
+        // Page 1 had only GPU writes so copy_back_range marked it synced; page 0 had a
+        // concurrent CPU write at [32..36) so page 0 stayed dirty for the next refresh.
+        let copied_after_pass0 = dst_shadow
+            .copied
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            copied_after_pass0[1] > copied_after_pass0[0],
+            "pure-GPU page 1 should advance copied while CPU+GPU page 0 stays dirty: {copied_after_pass0:?}"
+        );
+
+        // Submission 2: refresh dst_shadow (uploads merged page 0 into DEFAULT VRAM)
+        // and run pass 1 on the GPU, which combines page 0's GPU output, page 0's
+        // concurrent CPU write, and page 1's GPU output from DEFAULT VRAM.
+        list.reset();
+        list.keep(&root);
+        list.keep(&pso);
+        dst_shadow.refresh(&list, dst_mem.addr(), (2 * PAGE) as u64);
+        dst_shadow.gpu_writes(&list, dst_mem.addr(), 64);
+        let pass1 = [1u32, PAGE as u32];
+        // SAFETY: open command list with live pipeline and default-heap shadow buffers.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRoot32BitConstants(0, 2, pass1.as_ptr().cast(), 0);
+            list.list
+                .SetComputeRootShaderResourceView(1, src_shadow.gpu(src_mem.addr()));
+            list.list
+                .SetComputeRootUnorderedAccessView(2, dst_shadow.gpu(dst_mem.addr()));
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let expected_combined = (expected_p0 ^ 0xCAFE_F00Du32).wrapping_add(expected_p1);
+        assert_eq!(word(dst_mem.bytes_mut(), 16), expected_combined);
+        assert_eq!(DEBUG_ERRORS.load(AtomicOrdering::Relaxed), 0);
     }
 }

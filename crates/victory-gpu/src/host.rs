@@ -418,7 +418,7 @@ unsafe impl Send for StagingArena {}
 
 const STAGING_CHUNK: u64 = 4 << 20;
 const MAX_POOLED_STAGING_CHUNKS: usize = 8;
-const MAX_POOLED_LARGE_STAGING: usize = 4;
+const MAX_POOLED_LARGE_STAGING: usize = 8;
 
 impl StagingArena {
     fn alloc(
@@ -476,12 +476,14 @@ impl StagingArena {
         self.current = 0;
         self.used = 0;
         self.chunks.truncate(MAX_POOLED_STAGING_CHUNKS);
+        if self.large.len() > MAX_POOLED_LARGE_STAGING {
+            // Keep buffers used by the just-completed submission ahead of idle
+            // peak buffers so steady-state sizes do not reallocate each frame.
+            self.large.sort_by_key(|a| std::cmp::Reverse((a.3, a.2)));
+            self.large.truncate(MAX_POOLED_LARGE_STAGING);
+        }
         for entry in &mut self.large {
             entry.3 = false;
-        }
-        if self.large.len() > MAX_POOLED_LARGE_STAGING {
-            self.large.sort_by_key(|a| std::cmp::Reverse(a.2));
-            self.large.truncate(MAX_POOLED_LARGE_STAGING);
         }
     }
 }
@@ -796,6 +798,7 @@ impl Host {
         // Run shadow uploads in a separate ExecuteCommandLists call so all
         // default-heap buffers decay cleanly back to COMMON before the title's
         // lists run (no fence wait needed between calls on the same queue).
+        let has_upload = upload_list.is_some();
         if let Some(up) = upload_list {
             // SAFETY: closed list; all resources stay alive until after the fence wait.
             unsafe { self.queue.ExecuteCommandLists(&[Some(up)]) };
@@ -828,12 +831,12 @@ impl Host {
                 }
             }
         };
-        if groups.len() == 1 {
+        if groups.len() <= 1 {
             // SAFETY: closed lists; separate ExecuteCommandLists calls let buffers
             // decay to COMMON between runs and readback with a single fence wait.
             unsafe {
-                if !groups[0].is_empty() {
-                    self.queue.ExecuteCommandLists(groups[0]);
+                if let Some(group) = groups.first().filter(|g| !g.is_empty()) {
+                    self.queue.ExecuteCommandLists(group);
                 }
                 if let Some(rb) = readback_list {
                     self.queue.ExecuteCommandLists(&[Some(rb)]);
@@ -841,6 +844,9 @@ impl Host {
             }
             wait_queue(&mut submitted);
         } else {
+            if has_upload {
+                wait_queue(&mut submitted);
+            }
             for (i, group) in groups.iter().enumerate() {
                 let started = std::time::Instant::now();
                 // SAFETY: closed lists.
@@ -2550,5 +2556,38 @@ mod batch {
         assert!(first_pair.contains(&(ptr1_next as usize)));
         assert!(first_pair.contains(&(ptr2_next as usize)));
         assert_ne!(ptr1_next, ptr2_next);
+
+        // Populate idle larger buffers beyond MAX_POOLED_LARGE_STAGING, then
+        // verify active smaller oversized buffers are retained across reset.
+        arena.reset();
+        let huge = (super::STAGING_CHUNK as usize) * 6;
+        let mut huge_held = Vec::new();
+        for _ in 0..super::MAX_POOLED_LARGE_STAGING {
+            huge_held.push(
+                arena
+                    .alloc(host, super::StagingKind::Readback, huge)
+                    .expect("huge readback"),
+            );
+        }
+        drop(huge_held);
+        arena.reset();
+
+        let (_, _, active1) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("active small-oversized 1");
+        let (_, _, active2) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("active small-oversized 2");
+        arena.reset();
+
+        let (_, _, reused1) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("reused active 1");
+        let (_, _, reused2) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("reused active 2");
+        let active_pair = [active1 as usize, active2 as usize];
+        assert!(active_pair.contains(&(reused1 as usize)));
+        assert!(active_pair.contains(&(reused2 as usize)));
     }
 }
