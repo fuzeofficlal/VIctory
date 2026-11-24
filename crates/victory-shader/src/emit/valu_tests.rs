@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -122,13 +122,17 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         code,
     };
 
+    lower_compute(&native)
+}
+
+fn lower_compute(native: &NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -210,6 +214,94 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn scalar_buffer_load_and_descriptor_size_follow_the_raw_view() {
+    let mut words = vec![s_mov_b32(1, 0x80)];
+    words.extend(s_load_dwordx4(4, 0));
+    let mut output = s_load_dwordx4(8, 0);
+    output[1] |= 32; // second heap slot
+    words.extend(output);
+    words.extend([
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF420_0302,
+        0xFA00_0014, // s_buffer_load_dword s12, s[4:7], 20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        vop1(0x001, 0, sgpr(12)),
+        vop1(0x001, 1, sgpr(6)), // descriptor dword 2
+    ]);
+    words.extend(buffer_store_dword(0, 8, 0));
+    words.extend(buffer_store_dword(1, 8, 4));
+    words.push(S_ENDPGM);
+
+    let range = |kind, table_offset_dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let shader = lower_compute(&NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![range(ResourceType::Srv, 0), range(ResourceType::Uav, 8)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+    });
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let data = [81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92];
+    let mut ran = false;
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {backend} device; skipped");
+            continue;
+        };
+        let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+        for input in [&data[..8], &data[..]] {
+            let result = host
+                .dispatch(
+                    &root,
+                    &pipeline,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                        )],
+                        views: &[
+                            View::Buffer {
+                                data: input,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(2),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let bytes = std::mem::size_of_val(input) as u32;
+            assert_eq!(result[0], [86, bytes], "{backend}, {bytes}-byte view");
+        }
+        ran = true;
+    }
+    assert!(ran, "neither hardware nor WARP SM 6.6 device available");
 }
 
 fn is_f16_nan(bits: u16) -> bool {
