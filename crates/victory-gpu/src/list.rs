@@ -1720,4 +1720,137 @@ mod tests {
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_converts_between_packed_and_widened_targets() {
+        use crate::resource::{PACKED_16, RGBA8_UNORM, pack_rgba8_to_16, packed_test, target_format};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        eprintln!("adapter: {}", packed_test::adapter_name(host));
+        let mut cmd = packed_test::GuestCmd::new();
+
+        let pack_rgba = |format: u32, rgba: [u8; 4]| -> u16 {
+            let mut out = [0u8; 2];
+            pack_rgba8_to_16(format, &rgba, &mut out);
+            u16::from_le_bytes(out)
+        };
+
+        for fmt in PACKED_16 {
+            let msaa_supported = packed_test::adapter_supports_packed_msaa(&host.device, fmt, 4);
+            let msaa_phys = target_format(fmt, 1, (4, 0));
+            let uav_phys = target_format(fmt, 5, (1, 0));
+            eprintln!(
+                "f{fmt}: msaa={msaa_supported}, msaa_rt->f{msaa_phys}, uav_rt->f{uav_phys}"
+            );
+
+            // Mandatory cross-backend path when MSAA falls back to RGBA8_UNORM:
+            // physical 28 MSAA (logical 86/115) -> physical 86/115 single-sample.
+            if msaa_phys == RGBA8_UNORM {
+                let rtv_2dms = [fmt, 6, 0, 0, 0, 0];
+
+                // 1) Same-size resolve (4x4 -> 4x4).
+                let msaa_same = cmd.make_texture(4, 4, fmt, 1, 1, 1, 4);
+                let dst_same = cmd.make_texture(4, 4, fmt, 0, 1, 1, 1);
+                assert_eq!(packed_test::physical_format(msaa_same), RGBA8_UNORM);
+                assert_eq!(packed_test::physical_format(dst_same), fmt);
+                cmd.clear_rtv(msaa_same, Some(&rtv_2dms), &[1.0, 0.0, 0.0, 1.0], &[]);
+                cmd.resolve(dst_same, 0, msaa_same, 0, fmt);
+                cmd.execute();
+                cmd.reset();
+                let red = pack_rgba(fmt, [255, 0, 0, 255]);
+                let read = packed_test::readback_subresource(host, dst_same, 0, fmt, 4, 4, 256);
+                packed_test::assert_texels(fmt, fmt, &read, 256, 4, 4, |_, _| red);
+
+                // 2) Cropped src > dst resolve (6x6 -> 4x4) with spatial color rects.
+                let msaa_big = cmd.make_texture(6, 6, fmt, 1, 1, 1, 4);
+                let dst_small = cmd.make_texture(4, 4, fmt, 0, 1, 1, 1);
+                cmd.clear_rtv(msaa_big, Some(&rtv_2dms), &[0.0, 1.0, 0.0, 1.0], &[]);
+                cmd.clear_rtv(
+                    msaa_big,
+                    Some(&rtv_2dms),
+                    &[1.0, 0.0, 0.0, 1.0],
+                    &[[0, 0, 2, 2]],
+                );
+                cmd.clear_rtv(
+                    msaa_big,
+                    Some(&rtv_2dms),
+                    &[0.0, 0.0, 1.0, 1.0],
+                    &[[2, 2, 4, 4]],
+                );
+                cmd.resolve(dst_small, 0, msaa_big, 0, fmt);
+                cmd.execute();
+                cmd.reset();
+                let green = pack_rgba(fmt, [0, 255, 0, 255]);
+                let blue = pack_rgba(fmt, [0, 0, 255, 255]);
+                let cropped =
+                    packed_test::readback_subresource(host, dst_small, 0, fmt, 4, 4, 256);
+                packed_test::assert_texels(fmt, fmt, &cropped, 256, 4, 4, |x, y| {
+                    if x < 2 && y < 2 {
+                        red
+                    } else if (2..4).contains(&x) && (2..4).contains(&y) {
+                        blue
+                    } else {
+                        green
+                    }
+                });
+
+                // 3) Non-zero array slice & mip resolve (slice 1 -> slice 1 mip 1) with canary.
+                const CANARY: u16 = 0x4210;
+                let msaa_arr = cmd.make_texture(4, 4, fmt, 1, 1, 2, 4);
+                let dst_arr = cmd.make_texture(8, 8, fmt, 0, 2, 2, 1);
+                packed_test::upload_2d(&mut cmd, dst_arr, 0, fmt, (8, 8), 256, |_, _| CANARY);
+                packed_test::upload_2d(&mut cmd, dst_arr, 1, fmt, (4, 4), 256, |_, _| CANARY);
+                packed_test::upload_2d(&mut cmd, dst_arr, 2, fmt, (8, 8), 256, |_, _| CANARY);
+                let rtv_slice1 = [fmt, 7, 1, 1, 0, 0]; // D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY
+                cmd.clear_rtv(msaa_arr, Some(&rtv_slice1), &[0.0, 1.0, 1.0, 1.0], &[]);
+                cmd.resolve(dst_arr, 3, msaa_arr, 1, fmt);
+                cmd.execute();
+                cmd.reset();
+                let cyan = pack_rgba(fmt, [0, 255, 255, 255]);
+                let sub3 = packed_test::readback_subresource(host, dst_arr, 3, fmt, 4, 4, 256);
+                packed_test::assert_texels(fmt, fmt, &sub3, 256, 4, 4, |_, _| cyan);
+                for (sub, w, h) in [(0, 8, 8), (1, 4, 4), (2, 8, 8)] {
+                    let keep =
+                        packed_test::readback_subresource(host, dst_arr, sub, fmt, w, h, 256);
+                    packed_test::assert_texels(fmt, fmt, &keep, 256, w, h, |_, _| CANARY);
+                }
+            }
+
+            // Capability-gated reverse path: native MSAA -> widened 28 single-sample if
+            // supported, else verify guest MSAA falls back to 28 and resolves cleanly.
+            let msaa_src = cmd.make_texture(4, 4, fmt, 1, 1, 1, 4);
+            let dst_uav = cmd.make_texture(4, 4, fmt, 5, 1, 1, 1);
+            let actual_src_phys = packed_test::physical_format(msaa_src);
+            let actual_dst_phys = packed_test::physical_format(dst_uav);
+            if !msaa_supported {
+                assert_eq!(
+                    actual_src_phys, RGBA8_UNORM,
+                    "unsupported MSAA format {fmt} must fall back to RGBA8_UNORM"
+                );
+            }
+            let rtv_2dms = [fmt, 6, 0, 0, 0, 0];
+            cmd.clear_rtv(msaa_src, Some(&rtv_2dms), &[1.0, 0.0, 0.0, 1.0], &[]);
+            cmd.resolve(dst_uav, 0, msaa_src, 0, fmt);
+            cmd.execute();
+            cmd.reset();
+            let red = pack_rgba(fmt, [255, 0, 0, 255]);
+            let read = packed_test::readback_subresource(
+                host,
+                dst_uav,
+                0,
+                actual_dst_phys,
+                4,
+                4,
+                256,
+            );
+            packed_test::assert_texels(fmt, actual_dst_phys, &read, 256, 4, 4, |_, _| red);
+            eprintln!(
+                "f{fmt} reverse/fallback: src f{actual_src_phys} -> dst f{actual_dst_phys}"
+            );
+            packed_test::assert_no_d3d12_errors(host);
+        }
+    }
 }

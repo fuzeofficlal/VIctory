@@ -523,3 +523,256 @@ fn write(
     list.keep(destination.texture);
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::{PACKED_16, RGBA8_UNORM, packed_test};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+    fn make_texture(device: &ID3D12Device, format: u32, width: u32, height: u32) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(format as i32),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut out = None;
+        // SAFETY: valid default 2D texture descriptor and output pointer.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut out,
+                )
+                .unwrap();
+        }
+        out.unwrap()
+    }
+
+    fn make_upload(
+        device: &ID3D12Device,
+        width: u32,
+        height: u32,
+        row_pitch: usize,
+        bytes: &[u16],
+    ) -> ID3D12Resource {
+        let len = row_pitch * height as usize;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut out = None;
+        // SAFETY: valid upload buffer descriptor and output pointer.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut out,
+                )
+                .unwrap();
+        }
+        let buf: ID3D12Resource = out.unwrap();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: newly created upload buffer spans `len` bytes.
+        unsafe {
+            buf.Map(0, None, Some(&mut mapped)).unwrap();
+            let dst = std::slice::from_raw_parts_mut(mapped.cast::<u8>(), len);
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let at = y * row_pitch + x * 2;
+                    dst[at..at + 2].copy_from_slice(&bytes[y * width as usize + x].to_le_bytes());
+                }
+            }
+            buf.Unmap(0, None);
+        }
+        buf
+    }
+
+    fn readback_raw(
+        host: &crate::host::Host,
+        texture: &ID3D12Resource,
+        format: u32,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let len = 256 * height as usize;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback = None;
+        // SAFETY: valid readback buffer descriptor and output pointer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback: ID3D12Resource = readback.unwrap();
+        let list = host.new_list().unwrap();
+        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT(format as i32),
+                Width: width,
+                Height: height,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        };
+        // SAFETY: `texture` is in COPY_SOURCE and `readback` is in COPY_DEST.
+        unsafe {
+            list.list.CopyTextureRegion(
+                &buffer_location(&readback, footprint),
+                0,
+                0,
+                0,
+                &texture_location(texture, 0),
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut out = vec![0u8; len];
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: `host.execute` waited for GPU completion.
+        unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE { Begin: 0, End: len }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            out.copy_from_slice(std::slice::from_raw_parts(mapped.cast::<u8>(), len));
+            readback.Unmap(0, None);
+        }
+        out
+    }
+
+    #[test]
+    fn packed_copy_converts_between_packed_16_and_rgba8_on_any_adapter() {
+        const W: u32 = 3;
+        const H: u32 = 2;
+        const VALUES: [u16; 6] = [0xfc00, 0x83e0, 0x001f, 0xaa53, 0x4210, 0xffff];
+        let Some(host) = host() else {
+            return;
+        };
+        for logical in PACKED_16 {
+            let src = make_texture(&host.device, logical, W, H);
+            let wide = make_texture(&host.device, RGBA8_UNORM, W, H);
+            let dst = make_texture(&host.device, logical, W, H);
+            let upload = make_upload(&host.device, W, H, 256, &VALUES);
+
+            let list = host.new_list().unwrap();
+            let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT(logical as i32),
+                    Width: W,
+                    Height: H,
+                    Depth: 1,
+                    RowPitch: 256,
+                },
+            };
+            // SAFETY: open direct list with live resources in valid states.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    &texture_location(&src, 0),
+                    0,
+                    0,
+                    0,
+                    &buffer_location(&upload, fp),
+                    None,
+                );
+                list.list.ResourceBarrier(&[transition(
+                    &src,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            assert!(record(&list, &wide, &src, logical, || {}));
+            // SAFETY: transition `wide` from COPY_DEST to COPY_SOURCE for reverse copy.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    &wide,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            assert!(record(&list, &dst, &wide, logical, || {}));
+            // SAFETY: transition `dst` from COPY_DEST to COPY_SOURCE for readback.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+
+            let wide_bytes = readback_raw(host, &wide, RGBA8_UNORM, W, H);
+            packed_test::assert_texels(logical, RGBA8_UNORM, &wide_bytes, 256, W, H, |x, y| {
+                VALUES[(y * W + x) as usize]
+            });
+            let dst_bytes = readback_raw(host, &dst, logical, W, H);
+            packed_test::assert_texels(logical, logical, &dst_bytes, 256, W, H, |x, y| {
+                VALUES[(y * W + x) as usize]
+            });
+            packed_test::assert_no_d3d12_errors(host);
+        }
+    }
+}
