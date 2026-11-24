@@ -75,7 +75,7 @@ impl std::fmt::Debug for Shader {
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
-fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+pub(crate) fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
@@ -126,6 +126,11 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Whether this container has already attempted translation and failed.
+    pub(crate) fn failed(&self) -> bool {
+        matches!(self.translated.get(), Some(None))
     }
 }
 

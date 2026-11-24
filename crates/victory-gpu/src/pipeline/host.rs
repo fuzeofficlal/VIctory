@@ -288,6 +288,31 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Whether any active stage shader of `shaders` has already failed
+/// translation in this run, so queuing a worker for it cannot produce a host
+/// pipeline.
+pub(crate) fn has_failed_shader(shaders: &[Arc<Shader>]) -> bool {
+    if let [cs] = shaders
+        && cs.stage == "compute"
+    {
+        return cs.failed();
+    }
+    if shaders
+        .iter()
+        .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+    {
+        return false;
+    }
+    let find = |stage| shaders.iter().find(|s| s.stage == stage);
+    let Some(first) = find("mesh").or_else(|| find("vertex")) else {
+        return false;
+    };
+    if first.stage == "mesh" && !host().is_some_and(|h| h.mesh_shaders()) {
+        return false;
+    }
+    first.failed() || find("pixel").is_some_and(|s| s.failed())
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.

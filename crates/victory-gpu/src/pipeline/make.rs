@@ -109,6 +109,14 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
+        if super::host::has_failed_shader(&p.shaders) {
+            if p.made.set(None).is_ok() && p.queued.load(Ordering::Relaxed) {
+                let (lock, done) = &DONE;
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                done.notify_all();
+            }
+            return None;
+        }
         start(p);
         wait(p, crate::frame::current());
     }
@@ -234,5 +242,20 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn known_failed_shader_skips_worker_queue_and_frame_wait() {
+        let bad = super::super::shader("compute", b"synthetic invalid container");
+        assert!(bad.translated().is_none());
+        assert!(bad.failed());
+
+        let sibling = Arc::new(Pending::new(vec![bad], None));
+        assert!(ready(&sibling).is_none());
+        assert!(
+            !sibling.queued.load(Ordering::Relaxed),
+            "pipeline with an already-failed shader must not be queued to workers"
+        );
+        assert!(matches!(sibling.made.get(), Some(None)));
     }
 }
