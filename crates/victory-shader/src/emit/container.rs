@@ -368,7 +368,29 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shader::Mesh;
     use super::*;
+
+    fn u32_words(bytes: &[u8]) -> Vec<u32> {
+        let (chunks, rem) = bytes.as_chunks::<4>();
+        assert!(rem.is_empty());
+        chunks.iter().copied().map(u32::from_le_bytes).collect()
+    }
+
+    fn sig_el(name: &str, row: Option<u32>, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row,
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        }
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
@@ -385,5 +407,242 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn retail_hash_matches_reference_padding_across_block_boundaries() {
+        // Independent reference construction of the retail DXBC padding layout:
+        // left < 56 puts bit_len at byte 0 of the single tail block; left >= 56
+        // spills bit_len and `(len << 1) | 1` into a second 64-byte tail block.
+        let ref_hash = |input: &[u8]| -> [u8; 16] {
+            let n = input.len();
+            let rem = n % 64;
+            let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+            for full in input[..n - rem].as_chunks::<64>().0 {
+                md5_block(&mut state, full);
+            }
+            let bits = ((n as u32) << 3).to_le_bytes();
+            let count_tag = (((n as u32) << 1) | 1).to_le_bytes();
+            if rem < 56 {
+                let mut blk = [0u8; 64];
+                blk[..4].copy_from_slice(&bits);
+                blk[4..4 + rem].copy_from_slice(&input[n - rem..]);
+                blk[4 + rem] = 0x80;
+                blk[60..64].copy_from_slice(&count_tag);
+                md5_block(&mut state, &blk);
+            } else {
+                let mut blk0 = [0u8; 64];
+                blk0[..rem].copy_from_slice(&input[n - rem..]);
+                blk0[rem] = 0x80;
+                md5_block(&mut state, &blk0);
+                let mut blk1 = [0u8; 64];
+                blk1[..4].copy_from_slice(&bits);
+                blk1[60..64].copy_from_slice(&count_tag);
+                md5_block(&mut state, &blk1);
+            }
+            let mut out = [0u8; 16];
+            for (dst, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+                dst.copy_from_slice(&word.to_le_bytes());
+            }
+            out
+        };
+
+        let sample: Vec<u8> = (0..130).map(|i| (i as u8).wrapping_mul(37)).collect();
+        for len in [0, 1, 54, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128] {
+            assert_eq!(hash(&sample[..len]), ref_hash(&sample[..len]), "len {len}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retail_hash_matches_dxil_validator_for_all_64_remainders() {
+        use super::super::validator::Validator;
+        let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) else {
+            return;
+        };
+        let mut s = super::super::shader::Shader::new(true);
+        let entry = s.entry;
+        s.m.terminate(entry, super::super::bitcode::Term::Ret);
+        let base = s.finish();
+        let parsed = crate::dxbc::Container::parse(&base).unwrap();
+
+        for pad in 0..64usize {
+            let priv_data = vec![0x5au8; pad];
+            let mut parts: Vec<(&[u8; 4], &[u8])> =
+                parsed.parts.iter().map(|p| (&p.fourcc.0, p.data)).collect();
+            parts.push((b"PRIV", &priv_data));
+            let built = build(&parts);
+            let ours = built[4..20].to_vec();
+
+            let mut unsigned = built;
+            unsigned[4..20].fill(0);
+            validator.validate(&mut unsigned).unwrap();
+            assert_eq!(&unsigned[4..20], &ours[..], "padding length {pad}");
+        }
+    }
+
+    #[test]
+    fn container_header_and_chunk_offsets_handle_unaligned_parts() {
+        let empty = build(&[]);
+        assert_eq!(&empty[..4], b"DXBC");
+        assert_eq!(u32_words(&empty[20..]), [1, 32, 0]);
+        assert_eq!(&empty[4..20], &hash(&empty[20..]));
+
+        let c = build(&[(b"SFI0", &[1, 2, 3]), (b"ISG1", &[]), (b"OSG1", &[9])]);
+        assert_eq!(&c[..4], b"DXBC");
+        assert_eq!(u32_words(&c[20..44]), [1, 72, 3, 44, 55, 63]);
+        assert_eq!(&c[44..55], b"SFI0\x03\0\0\0\x01\x02\x03");
+        assert_eq!(&c[55..63], b"ISG1\0\0\0\0");
+        assert_eq!(&c[63..72], b"OSG1\x01\0\0\0\x09");
+        assert_eq!(&c[4..20], &hash(&c[20..]));
+    }
+
+    #[test]
+    fn signature_orders_rows_shares_system_names_and_encodes_masks() {
+        assert_eq!(u32_words(&signature(&[], true)), [0, 8]);
+
+        let els = [
+            SigElement {
+                index: 2,
+                usage: 0b01,
+                ..sig_el("TEXCOORD", Some(1), 2, 2)
+            },
+            SigElement {
+                index: 1,
+                kind: 16,
+                ..sig_el("SV_Target", Some(2), 0, 4)
+            },
+            SigElement {
+                index: 0,
+                comp: 4,
+                usage: 0b10,
+                ..sig_el("TEXCOORD", Some(0), 0, 2)
+            },
+            SigElement {
+                index: 0,
+                kind: 16,
+                ..sig_el("SV_Target", Some(1), 0, 4)
+            },
+            SigElement {
+                kind: 17,
+                ..sig_el("SV_Depth", None, 0, 1)
+            },
+        ];
+
+        let isg = signature(&els, true);
+        let osg = signature(&els, false);
+        assert_eq!(u32_words(&isg[..8]), [5, 8]);
+        assert_eq!(&isg[168..], b"TEXCOORD\0SV_Target\0TEXCOORD\0SV_Depth\0");
+
+        // Sorted by (row.unwrap_or(MAX), col): (0,0), (1,0), (1,2), (2,0), (MAX,0).
+        let expected_in = [
+            [0, 187, 0, 0, 2, 0, 0x0203, 0],
+            [0, 177, 0, 64, 3, 1, 0x0f0f, 0],
+            [0, 168, 2, 0, 3, 1, 0x040c, 0],
+            [0, 177, 1, 64, 3, 2, 0x0f0f, 0],
+            [0, 196, 0, 65, 3, u32::MAX, 0x0101, 0],
+        ];
+        for (idx, row) in expected_in.into_iter().enumerate() {
+            let at = 8 + idx * 32;
+            assert_eq!(u32_words(&isg[at..at + 32]), row);
+            let used = (row[6] >> 8) & 0xff;
+            let mut out_row = row;
+            out_row[6] = (row[6] & 0xff) | (((!used) & 0x0f) << 8);
+            assert_eq!(u32_words(&osg[at..at + 32]), out_row);
+        }
+    }
+
+    #[test]
+    fn psv_encodes_compute_pixel_vertex_and_mesh_metadata() {
+        let cs = psv(&Psv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            bindings: &[],
+            threads: [64, 2, 1],
+            wave_size: Some(64),
+        });
+        assert_eq!(
+            u32_words(&cs),
+            [48, 0, 0, 0, 0, 64, 64, 5, 0, 0, 64, 2, 1, 0, 4, 0, 0]
+        );
+
+        // Pixel sample-frequency bit activates for sample interpolation (6/7) or SV_SampleIndex (12).
+        for (interp, kind, sample_freq) in [(2, 0, 0u8), (6, 0, 1), (7, 0, 1), (0, 12, 1)] {
+            let inp = [SigElement {
+                interp,
+                kind,
+                ..sig_el("ATTR", Some(0), 0, 2)
+            }];
+            let ps = psv(&Psv {
+                stage: 0,
+                flag: true,
+                inputs: &inp,
+                outputs: &[],
+                prims: &[],
+                mesh: None,
+                bindings: &[],
+                threads: [0; 3],
+                wave_size: None,
+            });
+            assert_eq!(&ps[4..6], &[1, sample_freq]);
+            assert_eq!(u32_words(&ps[20..28]), [0, u32::MAX]);
+        }
+
+        // Vertex with >8 output rows spans two 32-bit words per input scalar in the dependency mask.
+        let vs_in = [sig_el("POS", Some(0), 0, 2)];
+        let vs_out = [sig_el("OUT", Some(8), 0, 2)];
+        let vs = psv(&Psv {
+            stage: 1,
+            flag: true,
+            inputs: &vs_in,
+            outputs: &vs_out,
+            prims: &[],
+            mesh: None,
+            bindings: &[Binding {
+                kind: 2,
+                space: 0,
+                register: 0,
+                dxil_kind: 13,
+            }],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        // 1 input vector * 4 scalars * 2 mask dwords = 8 trailing u32s: first 2 active, next 2 zero.
+        let tail = u32_words(&vs[vs.len() - 32..]);
+        assert_eq!(tail, [u32::MAX, 0b11, u32::MAX, 0b11, 0, 0, 0, 0]);
+
+        let ms_out = [SigElement {
+            kind: 3,
+            ..sig_el("SV_Position", Some(0), 0, 4)
+        }];
+        let ms_prim = [SigElement {
+            kind: 30,
+            comp: 1,
+            ..sig_el("SV_CullPrimitive", Some(0), 0, 1)
+        }];
+        let ms = psv(&Psv {
+            stage: 13,
+            flag: false,
+            inputs: &[],
+            outputs: &ms_out,
+            prims: &ms_prim,
+            mesh: Some((
+                Mesh {
+                    max_vertices: 96,
+                    max_primitives: 64,
+                    topology: 2,
+                },
+                2048,
+            )),
+            bindings: &[],
+            threads: [128, 1, 1],
+            wave_size: None,
+        });
+        assert_eq!(u32_words(&ms[..20]), [48, 2048, 0, 0, (64 << 16) | 96]);
+        assert_eq!(&ms[28..35], &[13, 0, 1, 2, 0, 1, 1]);
     }
 }
