@@ -3958,6 +3958,54 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
             }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                if v.abs != 0 || v.neg != 0 {
+                    return Err("integer operand modifiers");
+                }
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                // Integer 16-bit operands see the f32 bits of inline float constants.
+                let (mut a, mut bb) = (
+                    self.packed_src(inst, 0, false, false)?,
+                    self.packed_src(inst, 1, false, false)?,
+                );
+                let acc = s(self, 2)?;
+                let signed = name == "v_mad_i32_i16";
+                if signed {
+                    let k16 = self.s.m.i32(16);
+                    let ta = self.s.m.bin(c, Bin::Shl, a, k16);
+                    a = self.s.m.bin(c, Bin::AShr, ta, k16);
+                    let tb = self.s.m.bin(c, Bin::Shl, bb, k16);
+                    bb = self.s.m.bin(c, Bin::AShr, tb, k16);
+                }
+                let prod = self.s.m.bin(c, Bin::Mul, a, bb);
+                let sum = self.s.m.bin(c, Bin::Add, prod, acc);
+                let r = if !v.clamp {
+                    sum
+                } else if signed {
+                    // `prod` fits in [-2^30 + 2^15, 2^30], so only `prod + acc`
+                    // can overflow i32; when it does, `sum`'s sign bit flips.
+                    let ps = self.s.m.bin(c, Bin::Xor, prod, sum);
+                    let as_ = self.s.m.bin(c, Bin::Xor, acc, sum);
+                    let ov_bits = self.s.m.bin(c, Bin::And, ps, as_);
+                    let k0 = self.s.m.i32(0);
+                    let ov = self.s.m.cmp(c, pred::SLT, ov_bits, k0);
+                    let (k31, sign_bit) = (self.s.m.i32(31), self.s.m.i32(0x8000_0000));
+                    let mask = self.s.m.bin(c, Bin::AShr, sum, k31);
+                    let sat = self.s.m.bin(c, Bin::Xor, mask, sign_bit);
+                    self.s.m.select(c, ov, sat, sum)
+                } else {
+                    let ov = self.s.m.cmp(c, pred::IULT, sum, acc);
+                    let umax = self.s.m.i32(u32::MAX);
+                    self.s.m.select(c, ov, umax, sum)
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let r = match name {
@@ -5051,6 +5099,19 @@ impl<'a> Lower<'a> {
                 let b = self.s.m.bin(c, op, b, sh);
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
+            }
+            "v_lerp_u8" => {
+                // Per byte: (src0 + src1 + (src2 & 1)) >> 1, without cross-byte carries.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (one, lsb, low7) = (k(self, 1), k(self, 0x0101_0101), k(self, 0x7F7F_7F7F));
+                let x = self.s.m.bin(c, Bin::Xor, a, b);
+                let both = self.s.m.bin(c, Bin::And, a, b);
+                let half = self.s.m.bin(c, Bin::LShr, x, one);
+                let half = self.s.m.bin(c, Bin::And, half, low7);
+                let round = self.s.m.bin(c, Bin::And, x, d);
+                let round = self.s.m.bin(c, Bin::And, round, lsb);
+                let sum = self.s.m.bin(c, Bin::Add, both, half);
+                self.s.m.bin(c, Bin::Add, sum, round)
             }
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {

@@ -937,3 +937,506 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// VOP3 `op vdst, src0, src1, src2` with explicit `opsel`, `clamp`, and `[abs, omod, neg]`.
+const fn vop3_mods(
+    op: u16,
+    vdst: u8,
+    opsel: u8,
+    clamp: bool,
+    mods: [u8; 3],
+    srcs: [u16; 3],
+) -> [u32; 2] {
+    [
+        0x35 << 26
+            | (op as u32 & 0x3FF) << 16
+            | (clamp as u32) << 15
+            | ((opsel as u32) & 0xF) << 11
+            | ((mods[0] as u32) & 0x7) << 8
+            | vdst as u32,
+        (srcs[0] as u32 & 0x1FF)
+            | (srcs[1] as u32 & 0x1FF) << 9
+            | (srcs[2] as u32 & 0x1FF) << 18
+            | ((mods[1] as u32) & 0x3) << 27
+            | ((mods[2] as u32) & 0x7) << 29,
+    ]
+}
+
+fn try_lower_valu_cs(body: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i)));
+    }
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+}
+
+/// Enumerates every SM 6.6 DXGI adapter on the system (discrete GPU, integrated
+/// GPU, and WARP) so multi-GPU hosts validate shader execution on each driver.
+fn all_sm66_hosts() -> Vec<(String, Host)> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+
+    let mut out = Vec::new();
+    // SAFETY: plain DXGI adapter enumeration and D3D12 feature queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return out;
+        };
+        let mut saw_software = false;
+        let mut idx = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(idx) {
+            idx += 1;
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            let is_sw = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                continue;
+            }
+            let Some(device) = device else { continue };
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            if device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .is_err()
+                || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+            {
+                continue;
+            }
+            saw_software |= is_sw;
+            out.push((
+                format!("{name} (vendor={:#06x})", desc.VendorId),
+                Host { device },
+            ));
+        }
+        if !saw_software
+            && let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter1>()
+            && let Ok(desc) = warp.GetDesc1()
+        {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                && let Some(device) = device
+            {
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: D3D_SHADER_MODEL_6_6,
+                };
+                if device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut sm).cast(),
+                        size_of_val(&sm) as u32,
+                    )
+                    .is_ok()
+                    && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
+                {
+                    out.push((
+                        format!("WARP (vendor={:#06x})", desc.VendorId),
+                        Host { device },
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_cases_all_adapters(
+    hosts: &[(String, Host)],
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    assert!(!hosts.is_empty(), "no SM 6.6 D3D12 adapter available");
+    for (label, host) in hosts {
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            check(label, i, inputs, out[0][0]);
+        }
+    }
+}
+
+#[test]
+fn v_mad_32_16_and_lerp_u8_match_rdna2() {
+    // Pure-Rust algebraic check of the 4-byte SWAR identity across all 256*256*2 single-byte inputs.
+    for a in 0u32..=255 {
+        for b in 0u32..=255 {
+            for r in 0u32..=1 {
+                let want = (a + b + r) >> 1;
+                let x = a ^ b;
+                let got = (a & b) + ((x >> 1) & 0x7F) + (x & r & 1);
+                assert_eq!(got, want, "SWAR mismatch for a={a}, b={b}, r={r}");
+            }
+        }
+    }
+
+    // Reject unsupported modifiers cleanly.
+    let v123 = [vgpr(1), vgpr(2), vgpr(3)];
+    assert!(try_lower_valu_cs(&vop3_mods(0x373, 0, 0, false, [1, 0, 0], v123)).is_err());
+    assert!(try_lower_valu_cs(&vop3_mods(0x375, 0, 0, false, [0, 0, 1], v123)).is_err());
+    assert!(try_lower_valu_cs(&vop3_mods(0x373, 0, 0, false, [0, 1, 0], v123)).is_err());
+    assert!(try_lower_valu_cs(&vop3_mods(0x14d, 0, 0, true, [0, 0, 0], v123)).is_err());
+    assert!(try_lower_valu_cs(&vop3_mods(0x14d, 0, 0, false, [0, 1, 0], v123)).is_err());
+    assert!(try_lower_valu_cs(&vop3_mods(0x14d, 0, 0, false, [1, 0, 0], v123)).is_err());
+
+    let mad_u_lo = build_valu_cs(&vop3_mods(0x373, 0, 0b0000, false, [0; 3], v123));
+    let mad_u_clamp = build_valu_cs(&vop3_mods(0x373, 0, 0b0000, true, [0; 3], v123));
+    // Also set opsel[3:2]=0b11 on 32-bit dst/src2 to confirm they do not truncate 32-bit operands.
+    let mad_u_01 = build_valu_cs(&vop3_mods(0x373, 0, 0b1101, false, [0; 3], v123));
+    let mad_u_10 = build_valu_cs(&vop3_mods(0x373, 0, 0b1110, false, [0; 3], v123));
+    let mad_u_11 = build_valu_cs(&vop3_mods(0x373, 0, 0b1111, true, [0; 3], v123));
+
+    let mad_i_lo = build_valu_cs(&vop3_mods(0x375, 0, 0b0000, false, [0; 3], v123));
+    let mad_i_clamp = build_valu_cs(&vop3_mods(0x375, 0, 0b0000, true, [0; 3], v123));
+    let mad_i_01 = build_valu_cs(&vop3_mods(0x375, 0, 0b1101, false, [0; 3], v123));
+    let mad_i_10 = build_valu_cs(&vop3_mods(0x375, 0, 0b1110, false, [0; 3], v123));
+    let mad_i_11 = build_valu_cs(&vop3_mods(0x375, 0, 0b1111, true, [0; 3], v123));
+
+    let lerp_u8 = build_valu_cs(&vop3(0x14d, 0, vgpr(1), vgpr(2), vgpr(3)));
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts = all_sm66_hosts();
+    for (label, _) in &hosts {
+        eprintln!("v_mad_32_16_and_lerp_u8_match_rdna2 adapter: {label}");
+    }
+
+    // Unsigned cases: ([v1, v2, v3, 0], wrapping_lo, clamped_lo)
+    let u_cases: &[([u32; 4], u32, u32)] = &[
+        ([0xDEAD_0000, 0xBEEF_FFFF, 0, 0], 0, 0),
+        (
+            [0x1234_0001, 0x5678_FFFF, 0xFFFF_FFFF, 0],
+            0x0000_FFFE,
+            u32::MAX,
+        ),
+        // Exact u32::MAX without overflow: 65535 * 65535 + 0x0001_FFFE = 0xFFFF_FFFF.
+        (
+            [0xAAAA_FFFF, 0x5555_FFFF, 0x0001_FFFE, 0],
+            u32::MAX,
+            u32::MAX,
+        ),
+        // Minimal unsigned overflow: 65535 * 65535 + 0x0001_FFFF = 2^32 -> wraps to 0, clamps to u32::MAX.
+        ([0xAAAA_FFFF, 0x5555_FFFF, 0x0001_FFFF, 0], 0, u32::MAX),
+        // Maximal unsigned overflow: 65535 * 65535 + u32::MAX -> wraps to 0xFFFE_0000, clamps to u32::MAX.
+        (
+            [0x0000_FFFF, 0x0000_FFFF, u32::MAX, 0],
+            0xFFFE_0000,
+            u32::MAX,
+        ),
+        // Zero product + u32::MAX -> exact u32::MAX, no overflow.
+        ([0xFFFF_0000, 0xFFFF_8000, u32::MAX, 0], u32::MAX, u32::MAX),
+        // 0x8000 * 0x7FFF + 0x1234_5678 = 0x3FFF_8000 + 0x1234_5678 = 0x5233_D678.
+        (
+            [0x0001_8000, 0x0002_7FFF, 0x1234_5678, 0],
+            0x5233_D678,
+            0x5233_D678,
+        ),
+    ];
+    let u_in: Vec<[u32; 4]> = u_cases.iter().map(|c| c.0).collect();
+    run_cases_all_adapters(&hosts, &mad_u_lo, &u_in, |b, i, _, got| {
+        assert_eq!(got, u_cases[i].1, "{b}: v_mad_u32_u16 wrap case {i}");
+    });
+    run_cases_all_adapters(&hosts, &mad_u_clamp, &u_in, |b, i, _, got| {
+        assert_eq!(got, u_cases[i].2, "{b}: v_mad_u32_u16 clamp case {i}");
+    });
+
+    // Unsigned op_sel combinations (hi/lo, lo/hi, hi/hi+clamp) with full 32-bit src2.
+    run_cases_all_adapters(
+        &hosts,
+        &mad_u_01,
+        &[[0x8000_0002, 0x9999_0003, 0x1000_0005, 0]],
+        |b, _, _, got| assert_eq!(got, 0x8000 * 3 + 0x1000_0005, "{b}: v_mad_u32_u16 opsel 01"),
+    );
+    run_cases_all_adapters(
+        &hosts,
+        &mad_u_10,
+        &[[0x9999_0007, 0xFFFF_0002, 0x2000_0001, 0]],
+        |b, _, _, got| assert_eq!(got, 7 * 0xFFFF + 0x2000_0001, "{b}: v_mad_u32_u16 opsel 10"),
+    );
+    run_cases_all_adapters(
+        &hosts,
+        &mad_u_11,
+        &[[0xFFFF_0001, 0xFFFF_0001, 0x0002_0000, 0]],
+        |b, _, _, got| assert_eq!(got, u32::MAX, "{b}: v_mad_u32_u16 opsel 11 clamp"),
+    );
+
+    // Signed cases: ([v1, v2, v3, 0], wrapping_lo, clamped_lo)
+    let i_cases: &[([u32; 4], u32, u32)] = &[
+        // (-1) * (-1) + (-2) = -1
+        (
+            [0x7FFF_FFFF, 0x7FFF_FFFF, (-2i32) as u32, 0],
+            (-1i32) as u32,
+            (-1i32) as u32,
+        ),
+        // (-32768) * (-32768) = +2^30 (0x4000_0000); + 0 = +2^30.
+        ([0x0000_8000, 0x0000_8000, 0, 0], 0x4000_0000, 0x4000_0000),
+        // (-32768) * 32767 = -1_073_709_056 (0xC000_8000); + 0 = 0xC000_8000.
+        ([0xFFFF_8000, 0xFFFF_7FFF, 0, 0], 0xC000_8000, 0xC000_8000),
+        // Positive i32 overflow: (-32768) * (-32768) + i32::MAX -> wraps to 0xBFFF_FFFF, clamps to i32::MAX.
+        (
+            [0x0000_8000, 0x0000_8000, i32::MAX as u32, 0],
+            0xBFFF_FFFF,
+            i32::MAX as u32,
+        ),
+        // Exact i32::MAX without overflow: 1 * 1 + (i32::MAX - 1) = i32::MAX.
+        (
+            [0x8000_0001, 0x8000_0001, (i32::MAX - 1) as u32, 0],
+            i32::MAX as u32,
+            i32::MAX as u32,
+        ),
+        // Minimal positive overflow: 1 * 1 + i32::MAX -> wraps to 0x8000_0000, clamps to i32::MAX.
+        (
+            [0x8000_0001, 0x8000_0001, i32::MAX as u32, 0],
+            i32::MIN as u32,
+            i32::MAX as u32,
+        ),
+        // Negative i32 overflow: (-32768) * 32767 + i32::MIN -> wraps to 0x4000_8000, clamps to i32::MIN.
+        (
+            [0x0000_8000, 0x0000_7FFF, i32::MIN as u32, 0],
+            0x4000_8000,
+            i32::MIN as u32,
+        ),
+        // Minimal negative overflow: (-1) * 1 + i32::MIN -> wraps to 0x7FFF_FFFF, clamps to i32::MIN.
+        (
+            [0x0000_FFFF, 0x0000_0001, i32::MIN as u32, 0],
+            i32::MAX as u32,
+            i32::MIN as u32,
+        ),
+        // Zero product + i32::MIN -> exact i32::MIN, no false overflow.
+        (
+            [0xFFFF_0000, 0xFFFF_8000, i32::MIN as u32, 0],
+            i32::MIN as u32,
+            i32::MIN as u32,
+        ),
+    ];
+    let i_in: Vec<[u32; 4]> = i_cases.iter().map(|c| c.0).collect();
+    run_cases_all_adapters(&hosts, &mad_i_lo, &i_in, |b, i, _, got| {
+        assert_eq!(got, i_cases[i].1, "{b}: v_mad_i32_i16 wrap case {i}");
+    });
+    run_cases_all_adapters(&hosts, &mad_i_clamp, &i_in, |b, i, _, got| {
+        assert_eq!(got, i_cases[i].2, "{b}: v_mad_i32_i16 clamp case {i}");
+    });
+
+    // Signed op_sel combinations (hi/lo, lo/hi, hi/hi+clamp).
+    run_cases_all_adapters(
+        &hosts,
+        &mad_i_01,
+        &[[0x8000_0001, 0x7FFF_0002, 100, 0]],
+        |b, _, _, got| {
+            assert_eq!(
+                got,
+                (-32768i32 * 2 + 100) as u32,
+                "{b}: v_mad_i32_i16 opsel 01"
+            );
+        },
+    );
+    run_cases_all_adapters(
+        &hosts,
+        &mad_i_10,
+        &[[0x7FFF_FFFE, 0x8000_0005, (-50i32) as u32, 0]],
+        |b, _, _, got| {
+            assert_eq!(
+                got,
+                (-2i32 * -32768 - 50) as u32,
+                "{b}: v_mad_i32_i16 opsel 10"
+            );
+        },
+    );
+    run_cases_all_adapters(
+        &hosts,
+        &mad_i_11,
+        &[[0x8000_0001, 0x7FFF_0001, i32::MIN as u32, 0]],
+        |b, _, _, got| {
+            assert_eq!(got, i32::MIN as u32, "{b}: v_mad_i32_i16 opsel 11 clamp");
+        },
+    );
+
+    // Inline float constants on 16-bit integer MAD operands decode as 32-bit f32
+    // bit patterns (`OPERAND_REG_INLINE_C_INT16`): 242 = 1.0f32 = 0x3F80_0000
+    // (lo = 0x0000, hi = 0x3F80 = 16256; NOT f16 0x3C00) and 243 = -1.0f32 = 0xBF80_0000
+    // (hi = 0xBF80 = -16512i16).
+    let mad_u_inline_lo = build_valu_cs(&vop3_mods(
+        0x373,
+        0,
+        0b0000,
+        false,
+        [0; 3],
+        [242, vgpr(1), vgpr(2)],
+    ));
+    let mad_u_inline_hi = build_valu_cs(&vop3_mods(
+        0x373,
+        0,
+        0b0001,
+        false,
+        [0; 3],
+        [242, vgpr(1), vgpr(2)],
+    ));
+    let mad_i_inline_hi = build_valu_cs(&vop3_mods(
+        0x375,
+        0,
+        0b0001,
+        false,
+        [0; 3],
+        [243, vgpr(1), vgpr(2)],
+    ));
+    run_cases_all_adapters(
+        &hosts,
+        &mad_u_inline_lo,
+        &[[5, 99, 0, 0]],
+        |b, _, _, got| {
+            assert_eq!(
+                got, 99,
+                "{b}: v_mad_u32_u16 inline 1.0f32 lo half is 0x0000"
+            );
+        },
+    );
+    run_cases_all_adapters(
+        &hosts,
+        &mad_u_inline_hi,
+        &[[5, 99, 0, 0]],
+        |b, _, _, got| {
+            assert_eq!(
+                got,
+                0x3F80 * 5 + 99,
+                "{b}: v_mad_u32_u16 inline 1.0f32 hi half is 0x3F80"
+            );
+        },
+    );
+    run_cases_all_adapters(
+        &hosts,
+        &mad_i_inline_hi,
+        &[[3, 100, 0, 0]],
+        |b, _, _, got| {
+            assert_eq!(
+                got,
+                (-16512i32 * 3 + 100) as u32,
+                "{b}: v_mad_i32_i16 inline -1.0f32 hi half is 0xBF80 (-16512)"
+            );
+        },
+    );
+
+    // v_lerp_u8 cases across all 4 byte lanes simultaneously.
+    let lerp_ref = |a: u32, b: u32, c: u32| -> u32 {
+        let mut out = 0u32;
+        for i in 0..4 {
+            let ai = (a >> (8 * i)) & 0xFF;
+            let bi = (b >> (8 * i)) & 0xFF;
+            let ci = (c >> (8 * i)) & 0x01;
+            out |= ((ai + bi + ci) >> 1) << (8 * i);
+        }
+        out
+    };
+    let lerp_inputs: &[[u32; 4]] = &[
+        [0x0000_0000, 0x0000_0000, 0x0000_0000, 0],
+        [0x0000_0000, 0x0000_0000, 0xFFFF_FFFF, 0],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0x0000_0000, 0],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0],
+        [0xFEFF_FEFF, 0xFFFE_FFFF, 0x0100_0001, 0],
+        // Upper 7 bits of each byte in src2 are ignored (0xFE has LSB 0, 0xFD has LSB 1).
+        [0x0080_7FFE, 0x017F_80FF, 0xFEFD_FE00, 0],
+        [0x00FF_01FE, 0xFF00_FE01, 0x0100_0100, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0x55AA_F00F, 0],
+        [0x807F_0100, 0x8080_FF01, 0x0302_0100, 0],
+    ];
+    run_cases_all_adapters(&hosts, &lerp_u8, lerp_inputs, |b, i, inp, got| {
+        let want = lerp_ref(inp[0], inp[1], inp[2]);
+        assert_eq!(
+            got, want,
+            "{b}: v_lerp_u8 case {i} ({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2]
+        );
+    });
+}
