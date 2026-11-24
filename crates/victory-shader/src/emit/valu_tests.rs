@@ -167,20 +167,20 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
-/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
+/// Runs `shader` on every available SM 6.6 host (all hardware GPUs and WARP)
+/// for each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
+    let hosts = Host::all();
+    assert!(
+        !hosts.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    for (label, host) in &hosts {
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -207,9 +207,7 @@ fn run_cases(
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, out[0][0]);
         }
-        ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
 fn is_f16_nan(bits: u16) -> bool {
@@ -265,47 +263,69 @@ fn packed_add_selects_halves_of_inline_constants() {
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
-    let nan = f32::NAN.to_bits();
+    let qnan = 0x7FC0_0000u32;
+    let nqnan = 0xFFC0_0001u32;
+    let snan = 0x7F80_0001u32;
+    let nsnan = 0xFF80_0001u32;
+    let pinf = f32::INFINITY.to_bits();
+    let ninf = f32::NEG_INFINITY.to_bits();
+    let pz = 0.0f32.to_bits();
+    let nz = (-0.0f32).to_bits();
     let f = f32::to_bits;
 
-    let cases: &[([u32; 4], Option<f32>)] = &[
-        // Normal medians (all orderings).
-        ([f(1.0), f(2.0), f(3.0), 0], Some(2.0)),
-        ([f(3.0), f(1.0), f(2.0), 0], Some(2.0)),
-        ([f(-5.0), f(0.0), f(5.0), 0], Some(0.0)),
-        ([f(1.0), f(1.0), f(2.0), 0], Some(1.0)),
-        // One NaN: RDNA2 returns min3 of the non-NaN operands.
-        ([f(1.0), f(2.0), nan, 0], Some(1.0)),
-        ([nan, f(1.0), f(0.0), 0], Some(0.0)),
-        ([nan, f(0.0), f(1.0), 0], Some(0.0)),
-        ([f(2.0), nan, f(1.0), 0], Some(1.0)),
-        ([f(-3.0), nan, f(4.0), 0], Some(-3.0)),
-        // Two NaNs: returns the sole non-NaN operand.
-        ([nan, f(5.0), nan, 0], Some(5.0)),
-        ([nan, nan, f(-2.0), 0], Some(-2.0)),
-        ([f(7.0), nan, nan, 0], Some(7.0)),
-        // Three NaNs: returns NaN.
-        ([nan, nan, nan, 0], None),
+    let cases: &[([u32; 4], Option<u32>)] = &[
+        // Normal medians (all 6 permutations + ties + infinities + signed zeros).
+        ([f(1.0), f(2.0), f(3.0), 0], Some(f(2.0))),
+        ([f(1.0), f(3.0), f(2.0), 0], Some(f(2.0))),
+        ([f(2.0), f(1.0), f(3.0), 0], Some(f(2.0))),
+        ([f(2.0), f(3.0), f(1.0), 0], Some(f(2.0))),
+        ([f(3.0), f(1.0), f(2.0), 0], Some(f(2.0))),
+        ([f(3.0), f(2.0), f(1.0), 0], Some(f(2.0))),
+        ([f(-5.0), pz, f(5.0), 0], Some(pz)),
+        ([f(1.0), f(1.0), f(2.0), 0], Some(f(1.0))),
+        ([ninf, f(4.0), pinf, 0], Some(f(4.0))),
+        ([nz, nz, f(1.0), 0], Some(nz)),
+        ([pz, pz, f(-1.0), 0], Some(pz)),
+        // One qNaN or sNaN in each operand slot: returns min of the non-NaN operands.
+        ([f(1.0), f(2.0), qnan, 0], Some(f(1.0))),
+        ([f(1.0), f(2.0), snan, 0], Some(f(1.0))),
+        ([qnan, f(1.0), pz, 0], Some(pz)),
+        ([snan, pz, f(1.0), 0], Some(pz)),
+        ([f(2.0), nqnan, f(1.0), 0], Some(f(1.0))),
+        ([f(-3.0), nsnan, f(4.0), 0], Some(f(-3.0))),
+        ([pinf, ninf, snan, 0], Some(ninf)),
+        ([pinf, snan, pinf, 0], Some(pinf)),
+        ([nz, pz, qnan, 0], Some(nz)),
+        ([pz, snan, nz, 0], Some(nz)),
+        ([nsnan, pz, nz, 0], Some(nz)),
+        // Two qNaNs/sNaNs across every slot pair: returns the sole non-NaN operand.
+        ([qnan, f(5.0), snan, 0], Some(f(5.0))),
+        ([snan, nqnan, f(-2.0), 0], Some(f(-2.0))),
+        ([f(7.0), nsnan, qnan, 0], Some(f(7.0))),
+        ([snan, pinf, nsnan, 0], Some(pinf)),
+        ([qnan, nqnan, ninf, 0], Some(ninf)),
+        ([nz, snan, qnan, 0], Some(nz)),
+        ([snan, pz, nqnan, 0], Some(pz)),
+        // Three NaNs (qNaN and sNaN): returns quiet NaN.
+        ([qnan, qnan, qnan, 0], None),
+        ([snan, snan, snan, 0], None),
+        ([nsnan, qnan, snan, 0], None),
     ];
 
     let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
-    run_cases(&shader, &inputs, |backend, i, inp, got| {
-        let expect = cases[i].1;
-        let got_f = f32::from_bits(got);
-        match expect {
-            Some(want) => assert_eq!(
-                got_f,
-                want,
-                "{backend}: v_med3_f32({:?}, {:?}, {:?}) = {got_f} ({got:#010x}), want {want}",
-                f32::from_bits(inp[0]),
-                f32::from_bits(inp[1]),
-                f32::from_bits(inp[2]),
-            ),
-            None => assert!(
-                got_f.is_nan(),
-                "{backend}: v_med3_f32(NaN, NaN, NaN) = {got_f} ({got:#010x}), want NaN",
-            ),
-        }
+    run_cases(&shader, &inputs, |backend, i, inp, got| match cases[i].1 {
+        Some(want) => assert_eq!(
+            got, want,
+            "{backend}: v_med3_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        ),
+        None => assert!(
+            f32::from_bits(got).is_nan() && (got & 0x0040_0000) != 0,
+            "{backend}: v_med3_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want quiet NaN",
+            inp[0],
+            inp[1],
+            inp[2],
+        ),
     });
 }
 
@@ -339,23 +359,34 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
-    let h0 = 0x0000u32; // 0.0
+    let h0 = 0x0000u32; // +0.0
+    let hnz = 0x8000u32; // -0.0
     let h1 = 0x3C00u32; // 1.0
     let h2 = 0x4000u32; // 2.0
     let h3 = 0x4200u32; // 3.0
     let h5 = 0x4500u32; // 5.0
     let hn2 = 0xC000u32; // -2.0
-    let nan = 0x7E00u32;
+    let hpinf = 0x7C00u32; // +inf
+    let hninf = 0xFC00u32; // -inf
+    let qnan = 0x7E00u32;
+    let snan = 0x7C01u32;
+    let nsnan = 0xFC01u32;
 
     let cases: &[([u32; 4], Option<u16>)] = &[
         ([h1, h2, h3, 0], Some(h2 as u16)),
         ([hn2, h0, h3, 0], Some(h0 as u16)),
-        ([h1, h2, nan, 0], Some(h1 as u16)),
-        ([nan, h1, h0, 0], Some(h0 as u16)),
-        ([nan, h0, h1, 0], Some(h0 as u16)),
-        ([h2, nan, h1, 0], Some(h1 as u16)),
-        ([nan, h5, nan, 0], Some(h5 as u16)),
-        ([nan, nan, nan, 0], None),
+        ([hninf, h1, hpinf, 0], Some(h1 as u16)),
+        ([h1, h2, qnan, 0], Some(h1 as u16)),
+        ([h1, h2, snan, 0], Some(h1 as u16)),
+        ([qnan, h1, h0, 0], Some(h0 as u16)),
+        ([snan, h0, h1, 0], Some(h0 as u16)),
+        ([h2, nsnan, h1, 0], Some(h1 as u16)),
+        ([hnz, h0, snan, 0], Some(hnz as u16)),
+        ([hpinf, snan, hninf, 0], Some(hninf as u16)),
+        ([qnan, h5, snan, 0], Some(h5 as u16)),
+        ([snan, hpinf, nsnan, 0], Some(hpinf as u16)),
+        ([qnan, qnan, qnan, 0], None),
+        ([snan, snan, snan, 0], None),
     ];
 
     let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
@@ -369,8 +400,8 @@ fn v_med3_f16_matches_rdna2_with_nan() {
                 inp[0], inp[1], inp[2],
             ),
             None => assert!(
-                is_f16_nan(got_h),
-                "{backend}: v_med3_f16(NaN, NaN, NaN) = {got_h:#06x}, want NaN",
+                is_f16_nan(got_h) && (got_h & 0x0200) != 0,
+                "{backend}: v_med3_f16(NaN, NaN, NaN) = {got_h:#06x}, want quiet NaN",
             ),
         }
     });

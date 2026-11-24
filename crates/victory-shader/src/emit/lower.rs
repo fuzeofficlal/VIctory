@@ -1467,19 +1467,38 @@ impl<'a> Lower<'a> {
     }
 
     /// The median of three. With a NaN among them the hardware gives the
-    /// minimum of the three instead (the host's minimum skips NaNs, so that
-    /// is the smallest number among them).
+    /// minimum of the non-NaN operands instead (or a quiet NaN if all three
+    /// are NaN). NaN is tested on integer bits (`|x| > +inf`) and replaced
+    /// with `+inf` before the minimum so drivers (Intel Xe-LP/Xe-LPG, mobile
+    /// NVIDIA) cannot fold `fcmp uno` to false or miscompile `FMin` on NaNs.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
         let hi = self.binary(35, a, b);
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
-        let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
-        self.s.m.select(c, nan, least, median)
+
+        let (mag, inf) = (self.s.m.i32(0x7FFF_FFFF), self.s.m.i32(0x7F80_0000));
+        let is_nan = |l: &mut Self, x: V| {
+            let bits = l.as_int(x);
+            let abs = l.s.m.bin(c, Bin::And, bits, mag);
+            l.s.m.cmp(c, pred::IUGT, abs, inf)
+        };
+        let (na, nb, nc) = (is_nan(self, a), is_nan(self, b), is_nan(self, third));
+        let nan_ab = self.s.m.bin(c, Bin::Or, na, nb);
+        let any_nan = self.s.m.bin(c, Bin::Or, nan_ab, nc);
+        let all_ab = self.s.m.bin(c, Bin::And, na, nb);
+        let all_nan = self.s.m.bin(c, Bin::And, all_ab, nc);
+
+        let pinf = self.s.m.f32(0x7F80_0000);
+        let aa = self.s.m.select(c, na, pinf, a);
+        let bb = self.s.m.select(c, nb, pinf, b);
+        let cc = self.s.m.select(c, nc, pinf, third);
+        let least = self.max_min(false, aa, bb);
+        let least = self.max_min(false, least, cc);
+        let qnan = self.s.m.f32(0x7FC0_0000);
+        let least = self.s.m.select(c, all_nan, qnan, least);
+        self.s.m.select(c, any_nan, least, median)
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it

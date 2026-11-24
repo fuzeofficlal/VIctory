@@ -77,10 +77,64 @@ impl Host {
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
-            let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
+            Self::check_sm66(device.ok_or("no device")?)
+        }
+    }
+
+    /// Every SM 6.6 hardware adapter on the machine, followed by WARP (or WARP
+    /// alone when `VICTORY_WARP=1` is set).
+    pub fn all() -> Vec<(String, Self)> {
+        let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let mut out = Vec::new();
+        if !warp_only {
+            // SAFETY: plain DXGI/D3D12 adapter enumeration and device creation.
+            unsafe {
+                if let Ok(factory) =
+                    CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                {
+                    let mut i = 0;
+                    while let Ok(adapter) = factory.EnumAdapters1(i) {
+                        i += 1;
+                        let Ok(desc) = adapter.GetDesc1() else {
+                            continue;
+                        };
+                        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                            continue;
+                        }
+                        let end = desc
+                            .Description
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.Description.len());
+                        let name = String::from_utf16_lossy(&desc.Description[..end]);
+                        let mut device: Option<ID3D12Device> = None;
+                        if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                            && let Some(dev) = device
+                            && let Ok(h) = Self::check_sm66(dev)
+                        {
+                            out.push((name, h));
+                        }
+                    }
+                }
+            }
+            if out.is_empty()
+                && let Ok(h) = Self::new(false)
+            {
+                out.push(("hardware".into(), h));
+            }
+        }
+        if let Ok(h) = Self::new(true) {
+            out.push(("warp".into(), h));
+        }
+        out
+    }
+
+    fn check_sm66(device: ID3D12Device) -> Result<Self, String> {
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: valid feature query struct for `D3D12_FEATURE_SHADER_MODEL`.
+        unsafe {
             device
                 .CheckFeatureSupport(
                     D3D12_FEATURE_SHADER_MODEL,
@@ -88,14 +142,14 @@ impl Host {
                     size_of_val(&sm) as u32,
                 )
                 .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
-            }
-            Ok(Host { device })
         }
+        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return Err(format!(
+                "the device supports SM {:#x} only",
+                sm.HighestShaderModel.0
+            ));
+        }
+        Ok(Host { device })
     }
 
     /// The root signature translated shaders expect: user data per stage
