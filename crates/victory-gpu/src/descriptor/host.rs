@@ -230,8 +230,16 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        let total = self.dynamic as usize;
+        let start = *next as usize;
+        // Search from `next` on, then runs starting before `next` (which may
+        // cross `next`, never the end of the heap).
+        let before = if start == 0 {
+            0
+        } else {
+            start.saturating_add(n - 1).min(total)
+        };
+        let starts = (start..total).chain(0..before);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -972,5 +980,42 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A free run that starts before the search cursor and extends past it
+    /// still satisfies a contiguous table request, while runs across the end
+    /// of the heap never wrap.
+    #[test]
+    fn dynamic_slots_span_the_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let head = heap.dynamic(2).unwrap();
+        let mid = heap.dynamic(4).unwrap();
+        let tail = heap.dynamic(2).unwrap();
+        let rest = heap.dynamic(heap.dynamic - 8).unwrap();
+        // Leave `mid` and `tail` (6 contiguous slots) free while the cursor
+        // sits between them after re-taking and releasing `mid`.
+        heap.release(mid, 4);
+        heap.release(tail, 2);
+        let probe = heap.dynamic(4).unwrap();
+        assert_eq!(probe, mid);
+        heap.release(probe, 4);
+
+        let six = heap.dynamic(6).expect("six contiguous slots cross cursor");
+        assert_eq!(six, mid);
+        assert_eq!(heap.dynamic(1), None);
+
+        // Freeing the first 3 and last 3 slots does not form a 6-slot run.
+        heap.release(head, 2);
+        heap.release(six, 1);
+        heap.release(rest + (heap.dynamic - 8) - 3, 3);
+        assert_eq!(heap.dynamic(6), None);
+
+        // Releasing everything lets a full-capacity request succeed from a
+        // non-zero cursor.
+        heap.release(six + 1, 5);
+        heap.release(rest, heap.dynamic - 11);
+        assert_eq!(heap.dynamic(heap.dynamic), Some(4));
     }
 }

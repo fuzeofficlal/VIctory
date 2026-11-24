@@ -984,6 +984,45 @@ impl Drop for Resource {
     }
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_buffer(width: u64, flags: u32) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_committed(
+            std::ptr::null(),
+            &heap,
+            0,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        ),
+        S_OK
+    );
+    out
+}
+
 pub(crate) extern "system" fn create_committed(
     _: This,
     heap: *const HeapProperties,

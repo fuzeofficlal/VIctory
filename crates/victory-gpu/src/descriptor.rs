@@ -666,6 +666,9 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(test, windows))]
+pub(crate) use tests::{test_sampler_heap, test_view_heap};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +682,33 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn test_view_heap(count: u32) -> This {
+        test_shader_heap(VIEWS_KIND, count)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn test_sampler_heap(count: u32) -> This {
+        test_shader_heap(SAMPLERS, count)
+    }
+
+    #[cfg(windows)]
+    fn test_shader_heap(kind: u32, count: u32) -> This {
+        let mut h = std::ptr::null();
+        let desc = HeapDesc {
+            kind,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        h
     }
 
     #[test]

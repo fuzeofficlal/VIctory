@@ -230,6 +230,21 @@ impl GraphicsState {
     }
 }
 
+#[cfg(test)]
+impl GraphicsState {
+    pub(crate) fn with_vec4_input(&mut self) {
+        let name = CString::new("POSITION").unwrap();
+        let ptr = name.as_ptr().cast();
+        self.names = vec![name];
+        self.inputs = vec![D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(ptr),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            ..Default::default()
+        }];
+    }
+}
+
 /// One input element: vertex buffer slot, byte offset, format.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Input {

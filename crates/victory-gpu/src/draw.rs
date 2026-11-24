@@ -74,19 +74,43 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-    /// A fresh table of the stage being bound could not be made.
-    table_failed: bool,
+    /// The dynamic slots the list holds, with their cache keys so a rejected
+    /// operation gives back only the tables it reserved.
+    dynamic: Vec<FreshTable>,
 }
 
-impl Drop for State {
+struct FreshTable {
+    key: (u64, u64),
+    heap: usize,
+    first: u32,
+    count: u32,
+}
+
+impl Drop for FreshTable {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic(self.heap, self.first, self.count);
     }
+}
+
+struct StageTables<'a> {
+    fresh: Vec<u8>,
+    made: Vec<(u8, u32)>,
+    plans: Vec<FreshPlan<'a>>,
+}
+
+enum FreshPlan<'a> {
+    Cached {
+        table: u64,
+        entries: Vec<&'a UsedResource>,
+    },
+    New {
+        slot: u8,
+        table: u64,
+        heap: &'static crate::descriptor::Heap,
+        first: u32,
+        count: u32,
+        entries: Vec<&'a UsedResource>,
+    },
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -352,6 +376,18 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
+        let index = if indexed {
+            let v = self.index;
+            if v.address == 0 || v.size == 0 {
+                return false;
+            }
+            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                return false;
+            };
+            Some((shadow, v))
+        } else {
+            None
+        };
         if !self.bind(list, p, false) {
             return false;
         }
@@ -383,11 +419,7 @@ impl State {
                 l.IASetVertexBuffers(0, Some(&views[..count]));
             }
         }
-        if indexed {
-            let v = self.index;
-            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
-            };
+        if let Some((shadow, v)) = index {
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -416,6 +448,23 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let mark = self.dynamic.len();
+        let mut reserved = Vec::with_capacity(p.stages.len());
+        for stage in &p.stages {
+            let Some(tables) = self.reserve_stage(&stage.translated().used, compute) else {
+                self.rollback_tables(mark);
+                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(
+                        dropped = n,
+                        "a draw or dispatch dropped: no dynamic slots for its tables"
+                    );
+                }
+                return false;
+            };
+            reserved.push(tables);
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -456,25 +505,14 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
-        for stage in &p.stages {
+        for (stage, tables) in p.stages.iter().zip(&reserved) {
             let t = stage.translated();
-            self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
-            if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
-                return false;
-            }
+            self.populate_stage(list, &t.used, tables, compute);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
-                    let fresh = made
+                    let fresh = tables
+                        .made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
@@ -591,18 +629,19 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                Err(_) => false,
-            };
+        let ran = list
+            .list
+            .cast::<ID3D12GraphicsCommandList6>()
+            .ok()
+            .filter(|_| self.prepare_for(list, false, true))
+            .is_some_and(|l6| {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                // SAFETY: an open list with everything set.
+                unsafe { l6.DispatchMesh(x, 1, 1) };
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                true
+            });
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -634,18 +673,19 @@ impl State {
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// Reserves dynamic slots for the tables a stage needs made afresh:
+    /// tables holding a constant buffer (the host wants 256-byte alignment,
+    /// the console only 16) and tables reaching past a capped host heap.
     ///
     /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    /// once. Returns `None` without touching `list` if any fresh table has no
+    /// room in the dynamic range; the caller rolls back earlier stages'
+    /// reservations from this bind.
+    fn reserve_stage<'a>(
+        &mut self,
+        used: &'a [UsedResource],
+        compute: bool,
+    ) -> Option<StageTables<'a>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -676,13 +716,9 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
-            }
-        }
         let mut made = Vec::new();
-        for slot in fresh {
+        let mut plans = Vec::new();
+        for &slot in &fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -708,64 +744,122 @@ impl State {
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let words = if heap.index(at).is_some() {
+                        // SAFETY: a descriptor slot inside `heap`.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }
+                    } else {
+                        [0; 3]
+                    };
+                    words.hash(&mut h);
                 }
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
-                    }
-                }
                 made.push((slot, first * 32));
+                plans.push(FreshPlan::Cached { table, entries });
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
-                // Without its fresh table the shader would read the title's
-                // slots, which for constant buffer tables hold no constant
-                // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
-                self.table_failed = true;
-                continue;
-            };
+            // Without its fresh table the shader would read the title's
+            // slots, which for constant buffer tables hold no constant view:
+            // a texture or null descriptor read as a buffer gives a wild
+            // address on AMD and the device is removed (#59).
+            let first = host.dynamic(n)?;
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
-                    }
-                    Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
+            self.dynamic.push(FreshTable {
+                key,
+                heap: std::ptr::from_ref(heap) as usize,
+                first,
+                count: n,
+            });
+            made.push((slot, first * 32));
+            plans.push(FreshPlan::New {
+                slot,
+                table,
+                heap,
+                first,
+                count: n,
+                entries,
+            });
+        }
+        Some(StageTables { fresh, made, plans })
+    }
+
+    /// Writes the host descriptors and prepares the resources of a stage
+    /// whose fresh tables [`State::reserve_stage`] already reserved.
+    fn populate_stage(
+        &self,
+        list: &HostList,
+        used: &[UsedResource],
+        tables: &StageTables<'_>,
+        compute: bool,
+    ) {
+        for u in used.iter().filter(|u| u.root == RootType::Table) {
+            if !tables.fresh.contains(&u.slot) {
+                self.table_entry(list, u, compute);
+            }
+        }
+        for plan in &tables.plans {
+            match plan {
+                FreshPlan::Cached { table, entries } => {
+                    let heap = self.heap_of(*table);
+                    for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        if heap.is_some_and(|h| h.index(handle).is_some())
+                            && let Some(view) = crate::descriptor::view(handle)
+                        {
                             readable(list, u, &view);
                         }
                     }
-                    None => {
-                        host.make_null(index);
-                        if used.is_some() {
-                            once!(slot, "a table entry without a view");
+                }
+                &FreshPlan::New {
+                    slot,
+                    table,
+                    heap,
+                    first,
+                    count,
+                    ref entries,
+                } => {
+                    let Some(host) = heap.host() else {
+                        continue;
+                    };
+                    // The whole range: a shader may index past the entries its
+                    // used-resource list names (descriptor arrays).
+                    for k in 0..count {
+                        let index = first + k;
+                        let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                        let at = table + u64::from(k) * 32;
+                        match heap.index(at).and_then(|_| crate::descriptor::view(at)) {
+                            Some(View::Constant(address, size)) => {
+                                let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                                    host.make_null(index);
+                                    continue;
+                                };
+                                list.defer_fill(to, address as *const u8, size as usize);
+                                host.constant_at(index, gpu, size);
+                            }
+                            Some(view) => {
+                                host.make_at(index, &view);
+                                if let Some(u) = used {
+                                    readable(list, u, &view);
+                                }
+                            }
+                            None => {
+                                host.make_null(index);
+                                if used.is_some() {
+                                    once!(slot, "a table entry without a view");
+                                }
+                            }
                         }
                     }
                 }
             }
-            made.push((slot, first * 32));
         }
-        made
+    }
+
+    fn rollback_tables(&mut self, mark: usize) {
+        for table in self.dynamic.drain(mark..) {
+            self.fresh_tables.remove(&table.key);
+        }
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -845,7 +939,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let mark = self.dynamic.len();
+        let ran = (!rects || self.rectangles_ready(vertices, first))
+            && self.prepare(list, false)
+            && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -863,10 +960,36 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
+            self.rollback_tables(mark);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    fn rectangles_ready(&self, count: u32, first: u32) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let rects = u64::from(count / 3);
+        let end = u64::from(first) + u64::from(count);
+        for slot in 0..32 {
+            if !p.inputs.iter().any(|e| e.slot == slot && !e.per_instance) {
+                continue;
+            }
+            let v = self.vertex[slot as usize];
+            let stride = u64::from(v.stride);
+            let from = v.address + u64::from(first) * stride;
+            if v.address == 0
+                || stride == 0
+                || end * stride > u64::from(v.size)
+                || crate::shadow::find(from, rects * 3 * stride).is_none()
+            {
+                once!(slot, "rectangle vertices outside their buffer");
+                return false;
+            }
+        }
+        true
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -876,6 +999,8 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
+        let end = u64::from(first) + u64::from(count);
+        let mut expanded = Vec::new();
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -891,7 +1016,7 @@ impl State {
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
                 || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
+                || end * stride > u64::from(v.size)
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
@@ -900,8 +1025,11 @@ impl State {
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
+            expanded.push((slot, elements, v.stride, from, gpu, to));
+        }
+        for (slot, elements, raw_stride, from, gpu, to) in expanded {
+            let stride = raw_stride as usize;
+            let (from, to, n) = (from as usize, to as usize, rects as usize);
             list.defer_host(move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
@@ -916,7 +1044,7 @@ impl State {
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
                 SizeInBytes: (rects * 6 * stride as u64) as u32,
-                StrideInBytes: v.stride,
+                StrideInBytes: raw_stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
@@ -1214,4 +1342,537 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::{create_cbv, create_uav, heap, test_sampler_heap, test_view_heap};
+    use crate::object::slot;
+    use crate::pipeline::host::GraphicsState;
+    use crate::pipeline::{Shader, Translated, test_pipeline};
+    use victory_shader::emit::HostShader;
+    use victory_shader::native::{ComputeIo, NativeProgram, RootParam, StageIo};
+    use victory_shader::{Container, HwStage};
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    use windows::core::s;
+
+    fn compile_hlsl(source: &[u8], target: windows::core::PCSTR) -> Vec<u8> {
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source slice and output pointer are valid for the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("test"),
+                None,
+                None,
+                s!("main"),
+                target,
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: the blob owns its buffer.
+        unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast(), code.GetBufferSize()) }
+            .to_vec()
+    }
+
+    fn cbv_table_entries(sizes: &[(u8, u32)]) -> Vec<UsedResource> {
+        sizes
+            .iter()
+            .map(|&(slot, count)| UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: (count - 1) * 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot,
+            })
+            .collect()
+    }
+
+    fn empty_host_shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
+        HostShader {
+            stage,
+            dxil,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        }
+    }
+
+    fn release_obj(this: This) {
+        slot::<extern "system" fn(This) -> u32>(this, 0x10)(this);
+    }
+
+    /// Reproduces the partial-reservation failure mode (#911) and verifies
+    /// that after rejecting a 4+3-slot bind under 6 free slots, the accepted
+    /// 2-slot table remains intact and a subsequent 6-slot contiguous fresh
+    /// table succeeds immediately.
+    #[test]
+    fn rejected_bind_releases_partial_tables_and_leaves_contiguous_span() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let cs = compile_hlsl(b"[numthreads(1,1,1)] void main() {}", s!("cs_5_1"));
+        let p_4_3 = HostPipeline::new(
+            &[Shader::for_test(
+                "compute",
+                Translated {
+                    host: empty_host_shader(HwStage::Cs, cs.clone()),
+                    used: cbv_table_entries(&[(0, 2), (1, 4), (2, 3)]),
+                },
+            )],
+            None,
+        )
+        .unwrap();
+        let p_6 = HostPipeline::new(
+            &[Shader::for_test(
+                "compute",
+                Translated {
+                    host: empty_host_shader(HwStage::Cs, cs),
+                    used: cbv_table_entries(&[(0, 2), (1, 6)]),
+                },
+            )],
+            None,
+        )
+        .unwrap();
+
+        let title_heap = test_view_heap(16);
+        let sampler_heap = test_sampler_heap(4);
+        let guest = heap(title_heap);
+        let view_heap = guest.host().unwrap();
+        // SAFETY: a live descriptor heap.
+        let dynamic_cap = unsafe { view_heap.heap.GetDesc() }.NumDescriptors - view_heap.count();
+
+        let mut state = State::default();
+        state.set_heaps(&[title_heap, sampler_heap]);
+        state.set_table(true, 0, guest.start);
+        assert!(state.bind(&list, &p_4_3, true));
+        assert_eq!(state.dynamic.len(), 1);
+        let (&accepted_key, &accepted_first) = state.fresh_tables.iter().next().unwrap();
+
+        // Leave 6 dynamic slots free after the accepted 2-slot table.
+        let blocker = view_heap.dynamic(dynamic_cap - 8).unwrap();
+        state.set_table(true, 1, guest.start + 2 * 32);
+        state.set_table(true, 2, guest.start + 6 * 32);
+        assert!(!state.bind(&list, &p_4_3, true));
+        assert_eq!(state.dynamic.len(), 1);
+        assert_eq!(state.fresh_tables.len(), 1);
+        assert_eq!(state.fresh_tables[&accepted_key], accepted_first);
+
+        // All 6 contiguous slots remain allocatable as one fresh table, even
+        // though the failed attempt stepped the allocator's cursor to +6.
+        assert!(state.bind(&list, &p_6, true));
+        assert_eq!(state.dynamic.len(), 2);
+        assert_eq!(state.fresh_tables[&accepted_key], accepted_first);
+        assert!(view_heap.dynamic(1).is_none());
+
+        view_heap.release(blocker, dynamic_cap - 8);
+        drop(state);
+        release_obj(sampler_heap);
+        release_obj(title_heap);
+    }
+
+    /// A graphics pipeline whose vertex stage reserves a fresh table before
+    /// its pixel stage runs out of dynamic slots rolls back the vertex table
+    /// too.
+    #[test]
+    fn multi_stage_graphics_rejection_rolls_back_earlier_stage_tables() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let vs_code = compile_hlsl(
+            b"float4 main() : SV_Position { return float4(0, 0, 0, 1); }",
+            s!("vs_5_0"),
+        );
+        let ps_code = compile_hlsl(
+            b"float4 main() : SV_Target { return float4(1, 0, 0, 1); }",
+            s!("ps_5_0"),
+        );
+        let vs = Shader::for_test(
+            "vertex",
+            Translated {
+                host: empty_host_shader(HwStage::Vs, vs_code),
+                used: cbv_table_entries(&[(0, 3)]),
+            },
+        );
+        let ps = Shader::for_test(
+            "pixel",
+            Translated {
+                host: empty_host_shader(HwStage::Ps, ps_code),
+                used: cbv_table_entries(&[(1, 4)]),
+            },
+        );
+        let mut g = GraphicsState::default();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let Some(pipeline) = HostPipeline::new(&[vs, ps], Some(&g)) else {
+            return;
+        };
+
+        let title_heap = test_view_heap(16);
+        let sampler_heap = test_sampler_heap(4);
+        let guest = heap(title_heap);
+        let view_heap = guest.host().unwrap();
+        // SAFETY: a live descriptor heap.
+        let dynamic_cap = unsafe { view_heap.heap.GetDesc() }.NumDescriptors - view_heap.count();
+        let blocker = view_heap.dynamic(dynamic_cap - 5).unwrap();
+
+        let mut state = State::default();
+        state.set_heaps(&[title_heap, sampler_heap]);
+        state.set_table(false, 0, guest.start);
+        state.set_table(false, 1, guest.start + 4 * 32);
+        assert!(!state.bind(&list, &pipeline, false));
+        assert!(state.dynamic.is_empty());
+        assert!(state.fresh_tables.is_empty());
+
+        let five = view_heap.dynamic(5).expect("all five slots remain free");
+        view_heap.release(five, 5);
+        view_heap.release(blocker, dynamic_cap - 5);
+        drop(state);
+        release_obj(sampler_heap);
+        release_obj(title_heap);
+    }
+
+    /// Indexed draws without a shadowed index buffer and rectangle-list draws
+    /// with invalid vertex buffers fail without retaining fresh tables.
+    #[test]
+    fn rejected_indexed_and_rectangle_draws_retain_no_fresh_tables() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let vs_code = compile_hlsl(
+            b"float4 main(float4 p : POSITION) : SV_Position { return p; }",
+            s!("vs_5_0"),
+        );
+        let ps_code = compile_hlsl(
+            b"float4 main() : SV_Target { return float4(0, 1, 0, 1); }",
+            s!("ps_5_0"),
+        );
+        let make_pair = || {
+            vec![
+                Shader::for_test(
+                    "vertex",
+                    Translated {
+                        host: empty_host_shader(HwStage::Vs, vs_code.clone()),
+                        used: cbv_table_entries(&[(0, 4)]),
+                    },
+                ),
+                Shader::for_test(
+                    "pixel",
+                    Translated {
+                        host: empty_host_shader(HwStage::Ps, ps_code.clone()),
+                        used: Vec::new(),
+                    },
+                ),
+            ]
+        };
+
+        let mut tri_g = Box::new(GraphicsState::default());
+        tri_g.with_vec4_input();
+        tri_g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        tri_g.targets.NumRenderTargets = 1;
+        tri_g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let tri_pso = test_pipeline(make_pair(), Some(tri_g));
+
+        let mut rect_g = Box::new(GraphicsState::default());
+        rect_g.with_vec4_input();
+        rect_g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(19);
+        rect_g.targets.NumRenderTargets = 1;
+        rect_g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let rect_pso = test_pipeline(make_pair(), Some(rect_g));
+
+        if crate::pipeline::host_pipeline(tri_pso).is_none()
+            || crate::pipeline::host_pipeline(rect_pso).is_none()
+        {
+            release_obj(tri_pso);
+            release_obj(rect_pso);
+            return;
+        }
+
+        let title_heap = test_view_heap(8);
+        let sampler_heap = test_sampler_heap(4);
+        let guest = heap(title_heap);
+        let view_heap = guest.host().unwrap();
+        // SAFETY: a live descriptor heap.
+        let dynamic_cap = unsafe { view_heap.heap.GetDesc() }.NumDescriptors - view_heap.count();
+        let blocker = view_heap.dynamic(dynamic_cap - 4).unwrap();
+
+        let mut state = State::default();
+        state.set_heaps(&[title_heap, sampler_heap]);
+        state.set_table(false, 0, guest.start);
+
+        // Indexed draw with an unshadowed/null index buffer.
+        state.set_pipeline(tri_pso);
+        state.set_topology(&list, 4);
+        state.set_index_buffer(None);
+        state.draw_indexed(&list, 3, 1, 0, 0, 0);
+        assert!(state.dynamic.is_empty());
+        assert!(state.fresh_tables.is_empty());
+
+        // Rectangle-list draw with missing vertex buffer memory.
+        state.set_pipeline(rect_pso);
+        state.set_topology(&list, RECTANGLES);
+        state.draw(&list, 3, 1, 0, 0);
+        assert!(state.dynamic.is_empty());
+        assert!(state.fresh_tables.is_empty());
+
+        let four = view_heap.dynamic(4).expect("all four slots remain free");
+        view_heap.release(four, 4);
+        view_heap.release(blocker, dynamic_cap - 4);
+        drop(state);
+        release_obj(tri_pso);
+        release_obj(rect_pso);
+        release_obj(sampler_heap);
+        release_obj(title_heap);
+    }
+
+    /// Runs a synthetic SM 6.6 compute shader on the host GPU after a rejected
+    /// multi-table bind, reading a 16-byte-aligned constant buffer from entry
+    /// 5 of a reclaimed 6-slot dynamic table and copying the result back to a
+    /// title UAV buffer.
+    #[test]
+    fn reclaimed_dynamic_table_executes_on_gpu_and_reads_back_constants() {
+        crate::on_failure(|msg| panic!("host failure: {msg}"));
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        let s_mov_b32 =
+            |sdst: u8, src0: u8| 0xBE80_0000 | u32::from(sdst) << 16 | 0x03 << 8 | u32::from(src0);
+        let smem = |op: u32, dst: u8, base: u8, off: u32| {
+            [
+                0x3D << 26 | op << 18 | u32::from(dst) << 6 | u32::from(base >> 1),
+                125 << 25 | (off & 0x1F_FFFF),
+            ]
+        };
+        let v_mov_b32_from_s =
+            |vdst: u8, ssrc: u8| 0x7E00_0000 | u32::from(vdst) << 17 | 0x01 << 9 | u32::from(ssrc);
+        let buffer_store_dword = |vdata: u8, srsrc: u8| {
+            [
+                0x38 << 26 | 0x1C << 18,
+                0x80 << 24 | (u32::from(srsrc >> 2) & 0x1F) << 16 | u32::from(vdata) << 8,
+            ]
+        };
+
+        let mut words = vec![
+            s_mov_b32(2, 0),
+            s_mov_b32(3, 0x80),
+            s_mov_b32(4, 1),
+            s_mov_b32(5, 0x80),
+        ];
+        words.extend_from_slice(&smem(0x02, 8, 2, 5 * 32)); // s_load_dwordx4 s[8:11], s[2:3], 160
+        words.extend_from_slice(&smem(0x08, 6, 8, 0)); // s_buffer_load_dword s6, s[8:11], 0
+        words.push(v_mov_b32_from_s(0, 6));
+        words.extend_from_slice(&smem(0x02, 12, 4, 0)); // s_load_dwordx4 s[12:15], s[4:5], 0
+        words.extend_from_slice(&buffer_store_dword(0, 12));
+        words.push(S_ENDPGM);
+
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: 5 * 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 1,
+                slot: 1,
+            },
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 1,
+                    slot: 1,
+                },
+            ],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let ir = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = victory_shader::structure::structure(&ir).unwrap();
+        let res =
+            victory_shader::resource::track(&ir, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = victory_shader::io::raise(&ir, &native).unwrap();
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let host_shader =
+            victory_shader::emit::emit(&container, &native, &ir, &st, &io, &res).unwrap();
+
+        // NVIDIA's SM 6.6 DXIL compiler needs more than the default 2 MiB
+        // test-thread stack in debug builds.
+        let run_shader = Shader::for_test(
+            "compute",
+            Translated {
+                host: host_shader,
+                used,
+            },
+        );
+        let Some(run_pso) = std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(move || HostPipeline::new(&[run_shader], None))
+            .unwrap()
+            .join()
+            .unwrap()
+        else {
+            return;
+        };
+        let fail_cs = compile_hlsl(b"[numthreads(1,1,1)] void main() {}", s!("cs_5_1"));
+        let fail_pso = HostPipeline::new(
+            &[Shader::for_test(
+                "compute",
+                Translated {
+                    host: empty_host_shader(HwStage::Cs, fail_cs.clone()),
+                    used: cbv_table_entries(&[(0, 4), (1, 3)]),
+                },
+            )],
+            None,
+        )
+        .unwrap();
+        let seed_pso = HostPipeline::new(
+            &[Shader::for_test(
+                "compute",
+                Translated {
+                    host: empty_host_shader(HwStage::Cs, fail_cs),
+                    used: cbv_table_entries(&[(0, 2)]),
+                },
+            )],
+            None,
+        )
+        .unwrap();
+
+        // Create synthetic title CBV and UAV buffers.
+        let cbv_res = crate::resource::test_buffer(4096, 0);
+        let uav_res = crate::resource::test_buffer(4096, 0x4); // ALLOW_UNORDERED_ACCESS
+        let (cbv_ptr, _) = crate::resource::buffer_bytes(cbv_res).unwrap();
+        let (uav_ptr, _) = crate::resource::buffer_bytes(uav_res).unwrap();
+        // 16-byte aligned (not 256-byte aligned) constant buffer payload.
+        let cbv_addr = cbv_ptr as u64 + 16;
+        // SAFETY: inside the 4096-byte buffer.
+        unsafe { (cbv_addr as *mut u32).write_unaligned(0x5eed_cafe) };
+
+        let title_heap = test_view_heap(32);
+        let sampler_heap = test_sampler_heap(4);
+        let guest = heap(title_heap);
+        let at = |i: u64| guest.start + i * 32;
+        create_cbv(
+            std::ptr::null(),
+            &[cbv_addr as u32, (cbv_addr >> 32) as u32, 64, 0],
+            at(2 + 5),
+        );
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: `D3D12_UNORDERED_ACCESS_VIEW_DESC` is 40 bytes (`[u32; 10]`).
+        let uav_words = unsafe { (&raw const uav_desc).cast::<[u32; 10]>().read_unaligned() };
+        create_uav(
+            std::ptr::null(),
+            uav_res,
+            std::ptr::null(),
+            &uav_words,
+            at(16),
+        );
+
+        let view_heap = guest.host().unwrap();
+        // SAFETY: a live descriptor heap.
+        let dynamic_cap = unsafe { view_heap.heap.GetDesc() }.NumDescriptors - view_heap.count();
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[title_heap, sampler_heap]);
+
+        // 1. Seed a 2-slot table, then leave 6 dynamic slots free.
+        state.set_table(true, 0, at(0));
+        assert!(state.bind(&list, &seed_pso, true));
+        assert_eq!(state.dynamic.len(), 1);
+        let blocker = view_heap.dynamic(dynamic_cap - 8).unwrap();
+
+        // 2. Reject a 4+3-slot bind; its 4-slot reservation rolls back.
+        state.set_table(true, 0, at(8));
+        state.set_table(true, 1, at(12));
+        assert!(!state.bind(&list, &fail_pso, true));
+        assert_eq!(state.dynamic.len(), 1);
+
+        // 3. Dispatch the SM 6.6 shader using a 6-slot fresh CBV table in the
+        //    reclaimed span and verify the GPU writes 0x5eed_cafe back.
+        state.set_table(true, 0, at(2));
+        state.set_table(true, 1, at(16));
+        assert!(state.bind(&list, &run_pso, true));
+        // SAFETY: `state.bind` bound the compute pipeline, heaps and user data.
+        unsafe { list.list.Dispatch(1, 1, 1) };
+        assert_eq!(state.dynamic.len(), 2);
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: inside the 4096-byte title UAV buffer, updated by copy-back.
+        let got = unsafe { uav_ptr.cast::<u32>().read_unaligned() };
+        assert_eq!(got, 0x5eed_cafe);
+
+        view_heap.release(blocker, dynamic_cap - 8);
+        drop(state);
+        release_obj(cbv_res);
+        release_obj(uav_res);
+        release_obj(sampler_heap);
+        release_obj(title_heap);
+    }
 }

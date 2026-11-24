@@ -102,6 +102,18 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(test)]
+    pub(crate) fn for_test(stage: &'static str, translated: Translated) -> Arc<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Arc::new(Self {
+            stage,
+            hash: format!("test-{stage}-{id:08x}"),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(translated)),
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -501,6 +513,19 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_pipeline(
+    shaders: Vec<Arc<Shader>>,
+    graphics: Option<Box<host::GraphicsState>>,
+) -> This {
+    let mut out = std::ptr::null();
+    assert_eq!(
+        hand_out(shaders, graphics, &PIPELINE_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    out
 }
 
 #[cfg(test)]
