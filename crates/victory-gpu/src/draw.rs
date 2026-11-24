@@ -164,6 +164,25 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+enum PrepareError {
+    PipelineUnavailable,
+    WrongPipelineKind,
+    MissingIndexShadow,
+    IndirectRectangles,
+}
+
+#[cfg(feature = "diagnostics")]
+impl PrepareError {
+    fn reason(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::PipelineUnavailable => return None,
+            Self::WrongPipelineKind => "host pipeline kind does not match the command",
+            Self::MissingIndexShadow => "index buffer has no host shadow",
+            Self::IndirectRectangles => "indirect rectangle draws are not supported",
+        })
+    }
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -325,24 +344,23 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
-    /// Brings the host list up to date for a draw; false if the draw cannot
-    /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
+    /// Brings the host list up to date for a draw.
+    fn prepare(&mut self, list: &HostList, indexed: bool) -> Result<(), PrepareError> {
         self.prepare_for(list, indexed, false)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> Result<(), PrepareError> {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return Err(PrepareError::PipelineUnavailable);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return Err(PrepareError::PipelineUnavailable);
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return Err(PrepareError::WrongPipelineKind);
         }
         self.bind(list, p, false);
         let l = &list.list;
@@ -376,7 +394,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
+                return Err(PrepareError::MissingIndexShadow);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -395,7 +413,7 @@ impl State {
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
-        true
+        Ok(())
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -542,8 +560,8 @@ impl State {
         self.frame_op_why(kind, compute, ran, None);
     }
 
-    /// [`State::frame_op`] with the reason a drop happened before a pipeline
-    /// was looked at (else the pipeline's).
+    /// [`State::frame_op`] with a known reason for the drop, falling back
+    /// to the pipeline's status.
     #[cfg(feature = "diagnostics")]
     fn frame_op_why(&self, kind: &str, compute: bool, ran: bool, why: Option<&str>) {
         if !tracing::enabled!(tracing::Level::DEBUG)
@@ -563,7 +581,10 @@ impl State {
                 Some(why) => format!("DROPPED: {why}"),
                 None => format!(
                     "DROPPED: {}",
-                    crate::pipeline::drop_reason(self.pipeline as This)
+                    crate::pipeline::drop_reason(self.pipeline as This).unwrap_or_else(|| {
+                        "has a host pipeline (prepare or bind failed, or another kind of pipeline)"
+                            .to_owned()
+                    })
                 ),
             }
         };
@@ -619,7 +640,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
+        let ran = self.prepare_for(list, false, true).is_ok()
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -870,7 +891,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let ran =
+            self.prepare(list, false).is_ok() && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -965,7 +987,7 @@ impl State {
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let ran = self.topology != RECTANGLES && self.prepare(list, true).is_ok();
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1056,26 +1078,33 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+        let prepared = match kind {
+            DRAW | INDEXED if self.topology == RECTANGLES => Err(PrepareError::IndirectRectangles),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
                     self.bind(list, p, true);
-                    true
+                    Ok(())
                 }
-                _ => false,
+                Some(_) => Err(PrepareError::WrongPipelineKind),
+                None => Err(PrepareError::PipelineUnavailable),
             },
-            _ => false,
+            _ => Err(PrepareError::WrongPipelineKind),
         };
         #[cfg(feature = "diagnostics")]
-        self.frame_op("indirect", kind == DISPATCH, ran);
-        if !ran {
+        let reason = prepared.as_ref().err().map(|error| match error.reason() {
+            Some(reason) => format!("indirect kind {kind}: {reason}"),
+            None => crate::pipeline::drop_reason(self.pipeline as This)
+                .unwrap_or_else(|| "host pipeline was unavailable during preparation".to_owned()),
+        });
+        #[cfg(feature = "diagnostics")]
+        self.frame_op_why("indirect", kind == DISPATCH, prepared.is_ok(), reason.as_deref());
+        if prepared.is_err() {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            if let Some(reason) = reason {
+                crate::pipeline::note_why(reason);
             }
             return false;
         }
