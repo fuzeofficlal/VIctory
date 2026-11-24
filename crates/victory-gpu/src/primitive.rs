@@ -141,10 +141,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Round to nearest, using the retained bit to make halfway cases even.
+    // Add any carry out of the mantissa into the exponent.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let retained_lsb = (man >> 13) & 1;
+    sign | (half + ((man + 0x0fff + retained_lsb) >> 13)) as u16
 }
 
 #[cfg(test)]
