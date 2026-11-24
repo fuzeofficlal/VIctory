@@ -1,9 +1,13 @@
 //! Tests for Wave64-on-Wave32 and portable LDS Wave64 compute lowering,
 //! using synthetic GFX10 machine code on hardware GPU and WARP.
 
+use super::container::{self, SigElement};
 use super::{HostShader, TranslateOptions, Wave64Mode, emit_with, translate_with};
 use crate::dxbc::{Container, FourCC};
-use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
+use crate::native::{
+    ComputeIo, HwStage, MeshIo, NativeProgram, PsInput, RootParam, RootType, StageIo, Usage,
+    VsOutput,
+};
 use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -85,14 +89,26 @@ fn s_ff1_i32_b64(dst: u32, src0: u32) -> u32 {
 fn s_and_saveexec_b64(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x24, src0)
 }
+fn s_and_saveexec_b32(dst: u32, src0: u32) -> u32 {
+    sop1(dst, 0x3C, src0)
+}
 fn s_or_saveexec_b64(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x25, src0)
+}
+fn s_andn2_saveexec_b64(dst: u32, src0: u32) -> u32 {
+    sop1(dst, 0x27, src0)
 }
 fn s_add_i32(dst: u32, src0: u32, src1: u32) -> u32 {
     sop2(dst, 0x02, src0, src1)
 }
+fn s_or_b32(dst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(dst, 0x10, src0, src1)
+}
 fn s_or_b64(dst: u32, src0: u32, src1: u32) -> u32 {
     sop2(dst, 0x11, src0, src1)
+}
+fn s_lshl_b32(dst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(dst, 0x1E, src0, src1)
 }
 fn s_cmp_lt_u32(src0: u32, src1: u32) -> u32 {
     sopc(0x0A, src0, src1)
@@ -116,6 +132,12 @@ fn v_readfirstlane_b32(sdst: u32, vsrc: u32) -> u32 {
 fn v_add_f32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
     vop2(0x03, dst, src0, vsrc1)
 }
+fn v_sub_f32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
+    vop2(0x04, dst, src0, vsrc1)
+}
+fn v_lshrrev_b32(dst: u32, shift: u32, vsrc1: u32) -> u32 {
+    vop2(0x16, dst, shift, vsrc1)
+}
 fn v_lshlrev_b32(dst: u32, shift: u32, vsrc1: u32) -> u32 {
     vop2(0x1A, dst, shift, vsrc1)
 }
@@ -134,6 +156,9 @@ fn v_sub_nc_u32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
 fn v_subrev_nc_u32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
     vop2(0x27, dst, src0, vsrc1)
 }
+fn v_cmp_le_f32(src0: u32, vsrc1: u32) -> u32 {
+    vopc(0x03, src0, vsrc1)
+}
 fn v_cmp_lt_u32(src0: u32, vsrc1: u32) -> u32 {
     vopc(0xC1, src0, vsrc1)
 }
@@ -142,6 +167,20 @@ fn v_cmp_eq_u32(src0: u32, vsrc1: u32) -> u32 {
 }
 fn v_cmp_gt_u32(src0: u32, vsrc1: u32) -> u32 {
     vopc(0xC4, src0, vsrc1)
+}
+fn v_interp_mov_f32(dst: u32, attr: u32, chan: u32, vertex: u32) -> u32 {
+    0xC802_0000 | ((dst & 0xFF) << 18) | ((attr & 0x3F) << 10) | ((chan & 3) << 8) | (vertex & 0xFF)
+}
+#[allow(clippy::too_many_arguments)]
+fn exp(target: u8, en: u8, done: bool, vm: bool, v0: u8, v1: u8, v2: u8, v3: u8) -> [u32; 2] {
+    [
+        0xF800_0000
+            | (u32::from(vm) << 12)
+            | (u32::from(done) << 11)
+            | (u32::from(target) << 4)
+            | u32::from(en & 0xF),
+        u32::from(v0) | (u32::from(v1) << 8) | (u32::from(v2) << 16) | (u32::from(v3) << 24),
+    ]
 }
 fn v_cndmask_b32(dst: u32, src0: u32, src1: u32, mask_s: u32) -> [u32; 2] {
     vop3(0x101, dst, src0, src1, mask_s)
@@ -249,8 +288,15 @@ fn lower_cs(
 }
 
 fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, ShaderError> {
-    let dxbc = empty_dxbc();
-    let container = Container::parse(&dxbc)?;
+    emit_program(&empty_dxbc(), native, mode)
+}
+
+fn emit_program(
+    dxbc: &[u8],
+    native: &NativeProgram,
+    mode: Wave64Mode,
+) -> Result<HostShader, ShaderError> {
+    let container = Container::parse(dxbc)?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
@@ -1053,7 +1099,7 @@ mod gpu {
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
-    use crate::emit::host::{Dispatch, Host, View};
+    use crate::emit::host::{Dispatch, Draw, Host, View};
 
     fn with_hosts(f: impl FnOnce(&[(String, Host)])) {
         static HOSTS: OnceLock<Mutex<Vec<(String, Host)>>> = OnceLock::new();
@@ -1950,6 +1996,579 @@ mod gpu {
             [1, 1, 1],
             64,
             &unguarded_expected,
+            true,
+            true,
+        );
+    }
+
+    fn validate_dxil(shader: &HostShader) {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .unwrap_or_else(|e| panic!("DXIL validation failed ({:?}): {e}", shader.stage));
+        }
+    }
+
+    fn sig_element(
+        name: &str,
+        index: u32,
+        kind: u8,
+        comp: u8,
+        row: Option<u32>,
+        cols: u8,
+        usage: u8,
+    ) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp,
+            interp: 0,
+            row,
+            col: 0,
+            cols,
+            usage,
+            half: false,
+        }
+    }
+
+    fn fullscreen_vs_readfirstlane(wave64: bool) -> (Vec<u8>, NativeProgram) {
+        let mut code = vec![
+            v_and_b32(1, inline_u(1), 0),
+            v_lshlrev_b32(1, inline_u(2), 1),
+            v_cvt_f32_u32(1, vgpr(1)),
+            v_add_f32(1, LIT, 1),
+            (-1.0f32).to_bits(),
+            v_lshrrev_b32(2, inline_u(1), 0),
+            v_lshlrev_b32(2, inline_u(2), 2),
+            v_cvt_f32_u32(2, vgpr(2)),
+            v_sub_f32(2, LIT, 2),
+            1.0f32.to_bits(),
+            v_mov_b32(3, inline_u(0)),
+            v_mov_b32(4, LIT),
+            1.0f32.to_bits(),
+            v_cmp_lt_u32(inline_u(0), 0),
+            if wave64 {
+                s_and_saveexec_b64(4, VCC)
+            } else {
+                s_and_saveexec_b32(4, VCC)
+            },
+            v_readfirstlane_b32(14, 0),
+            if wave64 {
+                s_or_b64(EXEC_LO, EXEC_LO, 4)
+            } else {
+                s_or_b32(EXEC_LO, EXEC_LO, 4)
+            },
+            v_cvt_f32_u32(5, 14),
+            v_mov_b32(6, LIT),
+            1.0f32.to_bits(),
+            v_mov_b32(7, LIT),
+            2.0f32.to_bits(),
+            v_mov_b32(8, LIT),
+            3.0f32.to_bits(),
+        ];
+        code.extend_from_slice(&exp(12, 0xF, false, false, 1, 2, 3, 4));
+        code.extend_from_slice(&exp(32, 0xF, true, false, 5, 6, 7, 8));
+        code.push(S_ENDPGM);
+
+        let osg1 = container::signature(
+            &[
+                sig_element("SV_Position", 0, 3, 9, Some(0), 4, 15),
+                sig_element("TEXCOORD", 0, 0, 9, Some(1), 4, 15),
+            ],
+            false,
+        );
+        let dxbc = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64,
+            vgprs: 16,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Vs {
+                inputs: Vec::new(),
+                outputs: vec![VsOutput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+            },
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        (dxbc, native)
+    }
+
+    fn texcoord0_passthrough_ps() -> (Vec<u8>, NativeProgram) {
+        let mut code = vec![
+            v_interp_mov_f32(0, 0, 0, 2),
+            v_interp_mov_f32(1, 0, 1, 2),
+            v_interp_mov_f32(2, 0, 2, 2),
+            v_interp_mov_f32(3, 0, 3, 2),
+        ];
+        code.extend_from_slice(&exp(0, 0xF, true, true, 0, 1, 2, 3));
+        code.push(S_ENDPGM);
+
+        let isg1 = container::signature(&[sig_element("TEXCOORD", 0, 0, 9, Some(1), 4, 15)], true);
+        let osg1 =
+            container::signature(&[sig_element("SV_Target", 0, 16, 9, Some(0), 4, 15)], false);
+        let dxbc = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    mask: 0xF,
+                    attr: 0,
+                    flat: true,
+                    fp16: false,
+                    pack2: false,
+                    row2: 1,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        (dxbc, native)
+    }
+
+    fn ps_pos_x_readfirstlane(wave64: bool) -> (Vec<u8>, NativeProgram) {
+        let mut code = vec![
+            v_mov_b32(1, vgpr(0)),
+            v_cmp_le_f32(LIT, 0),
+            2.0f32.to_bits(),
+            if wave64 {
+                s_and_saveexec_b64(4, VCC)
+            } else {
+                s_and_saveexec_b32(4, VCC)
+            },
+            v_readfirstlane_b32(6, 0),
+            v_mov_b32(1, 6),
+            if wave64 {
+                s_or_b64(EXEC_LO, EXEC_LO, 4)
+            } else {
+                s_or_b32(EXEC_LO, EXEC_LO, 4)
+            },
+            v_mov_b32(2, LIT),
+            1.0f32.to_bits(),
+        ];
+        code.extend_from_slice(&exp(0, 0xF, true, true, 1, 0, 2, 2));
+        code.push(S_ENDPGM);
+
+        let isg1 =
+            container::signature(&[sig_element("SV_Position", 0, 3, 9, Some(0), 4, 1)], true);
+        let osg1 =
+            container::signature(&[sig_element("SV_Target", 0, 16, 9, Some(0), 4, 15)], false);
+        let dxbc = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 1 << 8,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        (dxbc, native)
+    }
+
+    #[test]
+    fn vs_ps_readfirstlane_host_wave_contract() {
+        let (ps_pass_dxbc, ps_pass_native) = texcoord0_passthrough_ps();
+        let ps_pass = emit_program(&ps_pass_dxbc, &ps_pass_native, Wave64Mode::Native).unwrap();
+        validate_dxil(&ps_pass);
+
+        for wave64 in [false, true] {
+            let (vs_dxbc, vs_native) = fullscreen_vs_readfirstlane(wave64);
+            let vs = emit_program(&vs_dxbc, &vs_native, Wave64Mode::Native).unwrap();
+            validate_dxil(&vs);
+            assert_eq!(psv_wave_range(&vs), (0, u32::MAX));
+            assert_ne!(sfi0_flags(&vs) & 0x4000, 0);
+
+            let (ps_dxbc, ps_native) = ps_pos_x_readfirstlane(wave64);
+            let ps = emit_program(&ps_dxbc, &ps_native, Wave64Mode::Native).unwrap();
+            validate_dxil(&ps);
+            assert_eq!(psv_wave_range(&ps), (0, u32::MAX));
+            assert_ne!(sfi0_flags(&ps) & 0x4000, 0);
+
+            with_hosts(|hosts| {
+                assert!(!hosts.is_empty(), "expected at least one SM 6.6 adapter");
+                for (adapter_name, host) in hosts {
+                    let (root, pso) = host
+                        .pipeline(&vs, &ps_pass)
+                        .unwrap_or_else(|e| panic!("VS wave64={wave64} ({adapter_name}) PSO: {e}"));
+                    let vs_out = host
+                        .draw(
+                            &root,
+                            &pso,
+                            &Draw {
+                                roots: Vec::new(),
+                                textures: &[],
+                                samplers: &[],
+                                vertices: &[],
+                                stride: 0,
+                                size: (4, 1),
+                                mesh_groups: 0,
+                            },
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("VS wave64={wave64} ({adapter_name}) draw: {e}")
+                        });
+                    assert_eq!(
+                        vs_out,
+                        vec![[1.0, 1.0, 2.0, 3.0]; 4],
+                        "VS wave64={wave64} ({adapter_name}) pixel mismatch"
+                    );
+
+                    let (root, pso) = host
+                        .pipeline(&vs, &ps)
+                        .unwrap_or_else(|e| panic!("PS wave64={wave64} ({adapter_name}) PSO: {e}"));
+                    let ps_out = host
+                        .draw(
+                            &root,
+                            &pso,
+                            &Draw {
+                                roots: Vec::new(),
+                                textures: &[],
+                                samplers: &[],
+                                vertices: &[],
+                                stride: 0,
+                                size: (8, 1),
+                                mesh_groups: 0,
+                            },
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("PS wave64={wave64} ({adapter_name}) draw: {e}")
+                        });
+                    let xs: Vec<f32> = ps_out.iter().map(|px| px[0]).collect();
+                    let (_, _, max_lane) = host.wave_lanes();
+                    if max_lane >= 8 {
+                        assert_eq!(
+                            xs,
+                            vec![0.5, 1.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5],
+                            "PS wave64={wave64} ({adapter_name}) host-wave mismatch"
+                        );
+                    } else {
+                        assert_eq!(max_lane, 4, "{adapter_name}");
+                        assert_eq!(
+                            xs,
+                            vec![0.5, 1.5, 2.5, 2.5, 4.5, 4.5, 6.5, 6.5],
+                            "PS wave64={wave64} ({adapter_name}) 4-lane quad-wave mismatch"
+                        );
+                    }
+                }
+            });
+        }
+
+        // StageIo::Ms: Input::MeshGroup (v5) with v_readfirstlane_b32 succeeds without regression.
+        let mut ms_code = vec![v_readfirstlane_b32(2, 5)];
+        ms_code.extend_from_slice(&exp(20, 0x1, true, false, 9, 0, 0, 0));
+        ms_code.push(S_ENDPGM);
+        let ms_native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 16,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ms(MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: ms_code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let ms_dxbc = empty_dxbc();
+        for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+            let ms = emit_program(&ms_dxbc, &ms_native, mode)
+                .unwrap_or_else(|e| panic!("MS MeshGroup readfirstlane failed in {mode:?}: {e}"));
+            validate_dxil(&ms);
+            assert_eq!(psv_wave_range(&ms), (0, u32::MAX));
+        }
+    }
+
+    fn whole_wave_float_sum_multi_group_program(
+        threads: [u32; 3],
+        half1_nonzero: bool,
+        guard: Lane0Guard,
+    ) -> NativeProgram {
+        assert!(threads[0] == 64 || threads[0] == 128);
+        let vwaves = threads[0] / 64;
+        let mut code = vec![
+            v_and_b32(4, inline_u(63), 0),
+            v_lshrrev_b32(5, inline_u(6), 0),
+            s_lshl_b32(3, 2, inline_u(7)),
+            v_lshlrev_b32(6, inline_u(4), 5),
+            v_add_nc_u32(6, 3, 6),
+        ];
+        if half1_nonzero {
+            code.push(v_cmp_lt_u32(inline_u(31), 4));
+            code.push(v_subrev_nc_u32(3, inline_u(31), 4));
+        } else {
+            code.push(v_cmp_gt_u32(inline_u(32), 4));
+            code.push(v_add_nc_u32(3, inline_u(1), 4));
+        }
+        code.push(v_add_nc_u32(3, vgpr(6), 3));
+        code.push(v_cvt_f32_u32(3, vgpr(3)));
+        code.extend_from_slice(&v_cndmask_b32(2, inline_u(0), vgpr(3), VCC));
+
+        code.push(s_or_saveexec_b64(4, NEG_ONE));
+        code.extend_from_slice(&v_cndmask_b32(10, inline_u(0), vgpr(2), 4));
+        for shift in [0x111u32, 0x112, 0x114, 0x118] {
+            code.extend_from_slice(&dpp_row_shr(0x03, 10, 10, 10, shift, 0xF));
+        }
+        code.extend_from_slice(&v_permlanex16_b32(11, 10, NEG_ONE, NEG_ONE));
+        code.push(v_add_f32(10, vgpr(10), 11));
+        code.extend_from_slice(&v_readlane_b32(12, 10, inline_u(15)));
+        code.extend_from_slice(&v_readlane_b32(13, 10, inline_u(63)));
+        code.push(v_mov_b32(10, 12));
+        code.push(v_add_f32(10, 13, 10));
+        code.push(s_mov_b64(EXEC_LO, 4));
+
+        code.push(s_mov_b32(1, inline_u(0)));
+        code.extend_from_slice(&s_load_dwordx4(8, 0));
+        code.push(v_mov_b32(16, vgpr(10)));
+        for (reg, f) in [(17u32, 1.0f32), (18, 2.0), (19, 3.0)] {
+            code.push(v_mov_b32(reg, LIT));
+            code.push(f.to_bits());
+        }
+        if vwaves == 2 {
+            code.push(s_lshl_b32(3, 2, inline_u(1)));
+        } else {
+            code.push(s_mov_b32(3, 2));
+        }
+        code.push(v_add_nc_u32(15, 3, 5));
+        code.push(v_lshlrev_b32(15, inline_u(4), 15));
+
+        match guard {
+            Lane0Guard::TidEqZeroBranch => {
+                code.push(v_cmp_eq_u32(inline_u(0), 4));
+                code.push(s_and_saveexec_b64(6, VCC));
+                let br_idx = code.len();
+                code.push(0);
+                code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+                let after = code.len();
+                code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+                code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+            }
+            Lane0Guard::ReadFirstLaneBranch => {
+                code.push(v_readfirstlane_b32(14, 0));
+                code.push(v_cmp_eq_u32(14, 0));
+                code.push(s_and_saveexec_b64(6, VCC));
+                let br_idx = code.len();
+                code.push(0);
+                code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+                let after = code.len();
+                code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+                code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+            }
+            Lane0Guard::MbcntEqZeroBranch | Lane0Guard::TidEqZeroInline => unreachable!(),
+        }
+        code.push(S_ENDPGM);
+        make_cs_program(&code, threads, 0, true)
+    }
+
+    #[test]
+    fn gpu_multi_workgroup_4x1x1_wave_sections_float_sum() {
+        for (threads, vwaves) in [([64, 1, 1], 1u32), ([128, 1, 1], 2u32)] {
+            let mut expected = Vec::with_capacity((4 * vwaves * 4) as usize);
+            for gid in 0..4u32 {
+                for vwave in 0..vwaves {
+                    let sum = 528.0f32 + 32.0 * (gid * 128 + vwave * 16) as f32;
+                    expected.extend_from_slice(&[
+                        sum.to_bits(),
+                        1.0f32.to_bits(),
+                        2.0f32.to_bits(),
+                        3.0f32.to_bits(),
+                    ]);
+                }
+            }
+            for (label, half1_nonzero, guard) in [
+                ("mg_h0_tid0", false, Lane0Guard::TidEqZeroBranch),
+                ("mg_h1_tid0", true, Lane0Guard::TidEqZeroBranch),
+                ("mg_h0_firstlane", false, Lane0Guard::ReadFirstLaneBranch),
+                ("mg_h1_firstlane", true, Lane0Guard::ReadFirstLaneBranch),
+            ] {
+                let prog = whole_wave_float_sum_multi_group_program(threads, half1_nonzero, guard);
+                let expected_lds = match guard {
+                    Lane0Guard::ReadFirstLaneBranch => 4 * vwaves,
+                    _ => 2 * vwaves,
+                };
+                assert_eq!(
+                    lower_cs(&prog, Wave64Mode::Wave32).unwrap().lds_dwords,
+                    expected_lds
+                );
+                let name = format!("{label}_{}", threads[0]);
+                run_on_hosts_modes(
+                    &name,
+                    &prog,
+                    [4, 1, 1],
+                    expected.len() as u32,
+                    &expected,
+                    true,
+                    true,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_nested_3level_saveexec_andn2_readfirstlane() {
+        // 1. Uniform-block 3-level s_and_saveexec_b64 + s_andn2_saveexec_b64 nesting.
+        let mut uniform_code = vec![
+            v_and_b32(2, inline_u(63), 0),
+            v_mov_b32(3, inline_u(0)),
+            v_cmp_lt_u32(inline_u(7), 2),
+            s_and_saveexec_b64(4, VCC),
+            v_cmp_gt_u32(inline_u(48), 2),
+            s_and_saveexec_b64(6, VCC),
+            v_and_b32(4, inline_u(1), 2),
+            v_cmp_eq_u32(inline_u(0), 4),
+            s_and_saveexec_b64(8, VCC),
+            v_readfirstlane_b32(10, 2),
+            v_mov_b32(3, 10),
+            v_add_nc_u32(3, inline_u(1), 3),
+            s_andn2_saveexec_b64(8, 8),
+            v_readfirstlane_b32(10, 2),
+            v_mov_b32(3, 10),
+            v_add_nc_u32(3, inline_u(1), 3),
+            s_or_b64(EXEC_LO, EXEC_LO, 8),
+            s_andn2_saveexec_b64(6, 6),
+            v_readfirstlane_b32(10, 2),
+            v_mov_b32(3, 10),
+            v_add_nc_u32(3, inline_u(1), 3),
+            s_or_b64(EXEC_LO, EXEC_LO, 6),
+            s_andn2_saveexec_b64(4, 4),
+            v_readfirstlane_b32(10, 2),
+            v_mov_b32(3, 10),
+            v_add_nc_u32(3, inline_u(1), 3),
+            s_or_b64(EXEC_LO, EXEC_LO, 4),
+        ];
+        emit_uav_store(&mut uniform_code, 3, 0);
+        uniform_code.push(S_ENDPGM);
+
+        let uniform_prog = make_cs_program(&uniform_code, [128, 1, 1], 0, false);
+        let uniform_expected: Vec<u32> = (0..128u32)
+            .map(|g| {
+                let l = g & 63;
+                if l < 8 {
+                    1
+                } else if l < 48 {
+                    if l % 2 == 0 { 9 } else { 10 }
+                } else {
+                    49
+                }
+            })
+            .collect();
+        run_on_hosts_modes(
+            "nested_3level_uniform_saveexec_andn2",
+            &uniform_prog,
+            [1, 1, 1],
+            128,
+            &uniform_expected,
+            true,
+            true,
+        );
+
+        // 2. Divergent-branch 3-level nesting (s_cbranch_execz + s_andn2_saveexec_b64)
+        // merging into phi + outer uniform-join and cross-half guarded v_readfirstlane_b32.
+        let mut div_code = vec![
+            v_and_b32(2, inline_u(63), 0),
+            v_mov_b32(3, inline_u(0)),
+            v_cmp_gt_u32(inline_u(48), 2),
+            s_and_saveexec_b64(4, VCC),
+        ];
+        let br_l1_else = div_code.len();
+        div_code.push(0);
+        div_code.push(v_cmp_gt_u32(inline_u(32), 2));
+        div_code.push(s_and_saveexec_b64(6, VCC));
+        let br_l2_else = div_code.len();
+        div_code.push(0);
+        div_code.push(v_and_b32(4, inline_u(1), 2));
+        div_code.push(v_cmp_eq_u32(inline_u(0), 4));
+        div_code.push(s_and_saveexec_b64(8, VCC));
+        let br_l3_else = div_code.len();
+        div_code.push(0);
+        div_code.push(v_mov_b32(3, inline_u(31)));
+        let l3_else = div_code.len();
+        div_code[br_l3_else] = s_cbranch_execz((l3_else - (br_l3_else + 1)) as i16);
+        div_code.push(s_andn2_saveexec_b64(8, 8));
+        let br_l3_join = div_code.len();
+        div_code.push(0);
+        div_code.push(v_mov_b32(3, inline_u(32)));
+        let l3_join = div_code.len();
+        div_code[br_l3_join] = s_cbranch_execz((l3_join - (br_l3_join + 1)) as i16);
+        div_code.push(s_or_b64(EXEC_LO, EXEC_LO, 8));
+        let l2_else = div_code.len();
+        div_code[br_l2_else] = s_cbranch_execz((l2_else - (br_l2_else + 1)) as i16);
+        div_code.push(s_andn2_saveexec_b64(6, 6));
+        let br_l2_join = div_code.len();
+        div_code.push(0);
+        div_code.push(v_mov_b32(3, inline_u(22)));
+        let l2_join = div_code.len();
+        div_code[br_l2_join] = s_cbranch_execz((l2_join - (br_l2_join + 1)) as i16);
+        div_code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        let l1_else = div_code.len();
+        div_code[br_l1_else] = s_cbranch_execz((l1_else - (br_l1_else + 1)) as i16);
+        div_code.push(s_andn2_saveexec_b64(4, 4));
+        let br_l1_join = div_code.len();
+        div_code.push(0);
+        div_code.push(v_mov_b32(3, inline_u(12)));
+        let l1_join = div_code.len();
+        div_code[br_l1_join] = s_cbranch_execz((l1_join - (br_l1_join + 1)) as i16);
+        div_code.push(s_or_b64(EXEC_LO, EXEC_LO, 4));
+
+        div_code.extend([
+            v_readfirstlane_b32(14, 3),
+            v_cmp_lt_u32(inline_u(31), 2),
+            s_and_saveexec_b64(4, VCC),
+            v_readfirstlane_b32(15, 3),
+            s_or_b64(EXEC_LO, EXEC_LO, 4),
+            s_lshl_b32(14, 14, inline_u(8)),
+            s_lshl_b32(15, 15, inline_u(16)),
+            s_or_b32(14, 14, 15),
+            v_or_b32(1, 14, 3),
+        ]);
+        emit_uav_store(&mut div_code, 1, 0);
+        div_code.push(S_ENDPGM);
+
+        let div_prog = make_cs_program(&div_code, [128, 1, 1], 0, false);
+        let div_expected: Vec<u32> = (0..128u32)
+            .map(|g| {
+                let l = g & 63;
+                let leaf = if l < 32 {
+                    if l % 2 == 0 { 31 } else { 32 }
+                } else if l < 48 {
+                    22
+                } else {
+                    12
+                };
+                leaf | (31 << 8) | (22 << 16)
+            })
+            .collect();
+        run_on_hosts_modes(
+            "nested_3level_divergent_phi_readfirstlane",
+            &div_prog,
+            [1, 1, 1],
+            128,
+            &div_expected,
             true,
             true,
         );
