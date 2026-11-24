@@ -556,7 +556,17 @@ impl State {
             once!("a root SRV without a bound view heap: the draw is dropped");
             return false;
         };
-        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let shadow = address.and_then(|address| {
+            let shadow = crate::shadow::find(address, 1)?;
+            if !shadow.offset(address).is_multiple_of(16) {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "a root SRV not on 16 bytes reads zeros"
+                );
+                return None;
+            }
+            Some((address, shadow))
+        });
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let index = match self.root_srv_slots.get(&key) {
             Some(&index) => index,
@@ -568,20 +578,7 @@ impl State {
                 self.root_srv_slots.insert(key, index);
                 match &shadow {
                     Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
-                        } else {
-                            // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every read.
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root SRV not on 16 bytes reads zeros"
-                            );
-                            host.null_raw_at(index);
-                        }
+                        host.raw_at(index, &s.buffer, s.offset(*a), s.left(*a));
                     }
                     None => host.null_raw_at(index),
                 }
@@ -590,6 +587,7 @@ impl State {
         };
         if let Some((a, s)) = &shadow {
             s.refresh(list, *a, s.left(*a).min(1 << 20));
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
