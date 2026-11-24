@@ -956,6 +956,50 @@ fn pure_wave_sections_lds_allocation_and_emulate_contract() {
     assert_eq!(lower_cs(&p_ext, Wave64Mode::Wave32).unwrap().lds_dwords, 66);
 }
 
+#[test]
+fn wave_section_readlane_preexisting_vgpr_is_rejected() {
+    // v_readlane_b32 inside a wave::sections reading a pre-section VGPR (Sym::Own) and
+    // escaping must fail explicitly with Unsupported instead of miscompiling to Shape::Value.
+    let mut direct = vec![
+        v_add_nc_u32(2, inline_u(1), 0),
+        s_or_saveexec_b64(4, NEG_ONE),
+    ];
+    direct.extend_from_slice(&v_readlane_b32(12, 2, inline_u(35)));
+    direct.push(s_mov_b64(EXEC_LO, 4));
+    direct.push(v_mov_b32(1, 12));
+    emit_uav_store(&mut direct, 1, 0);
+    direct.push(S_ENDPGM);
+
+    let prog_direct = make_cs_program(&direct, [64, 1, 1], 0, false);
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let err = emit_cs(&prog_direct, mode).unwrap_err();
+        assert!(
+            matches!(err, ShaderError::Unsupported { .. }),
+            "expected Unsupported for Sym::Own readlane escape in {mode:?}, got {err:?}"
+        );
+    }
+
+    // Moving a pre-section VGPR across lanes via v_permlanex16_b32 inside wave::sections must
+    // also refuse to miscompile as Shape::Value.
+    let mut perm = vec![
+        v_add_nc_u32(2, inline_u(1), 0),
+        s_or_saveexec_b64(4, NEG_ONE),
+    ];
+    perm.extend_from_slice(&v_permlanex16_b32(10, 2, NEG_ONE, NEG_ONE));
+    perm.push(s_mov_b64(EXEC_LO, 4));
+    emit_uav_store(&mut perm, 10, 0);
+    perm.push(S_ENDPGM);
+
+    let prog_perm = make_cs_program(&perm, [64, 1, 1], 0, false);
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let err = emit_cs(&prog_perm, mode).unwrap_err();
+        assert!(
+            matches!(err, ShaderError::Unsupported { .. }),
+            "expected Unsupported for cross-lane Sym::Own escape in {mode:?}, got {err:?}"
+        );
+    }
+}
+
 #[cfg(windows)]
 mod gpu {
     use std::sync::{Mutex, OnceLock};
@@ -1550,5 +1594,225 @@ mod gpu {
             let prog = whole_wave_float_sum_uav_x4_program([64, 1, 1], 0, half1_nonzero, guard);
             run_on_hosts_modes(label, &prog, [1, 1, 1], 4, &expected, true, true);
         }
+    }
+
+    #[test]
+    fn gpu_uniform_guard_readfirstlane_masked_lane0_uav_x4() {
+        // Uniform-block s_and_saveexec_b64 (without s_cbranch_execz) masking off lane 0:
+        // tests v_readfirstlane_b32 guard handling on !emulating_wave64() (Wave32 <=32 threads
+        // and AMD Native 64-lane waves including hi ballot extraction) as well as Emulate/Wave32.
+        let build_guard_prog =
+            |threads: [u32; 3], min_active: u32, mask_63: bool, force_wave64: bool| {
+                let mut code = Vec::new();
+                if force_wave64 {
+                    // Use v_mbcnt so console_lanes = true and Native enforces WaveSize(64).
+                    code.extend_from_slice(&v_mbcnt_lo_u32_b32(14, NEG_ONE, inline_u(0)));
+                    code.extend_from_slice(&v_mbcnt_hi_u32_b32(14, NEG_ONE, vgpr(14)));
+                }
+                code.push(s_mov_b32(1, inline_u(0)));
+                code.extend_from_slice(&s_load_dwordx4(8, 0));
+                if mask_63 {
+                    code.push(v_and_b32(2, inline_u(63), 0));
+                } else {
+                    code.push(v_mov_b32(2, vgpr(0)));
+                }
+                code.push(v_cvt_f32_u32(16, vgpr(0)));
+                for (reg, f) in [(17u32, 1.0f32), (18, 2.0), (19, 3.0)] {
+                    code.push(v_mov_b32(reg, LIT));
+                    code.push(f.to_bits());
+                }
+                // Write each virtual 64-lane wave's result to dword offset (tid >> 6) * 4.
+                code.push(vop2(0x16, 15, inline_u(6), 0)); // v_lshrrev_b32 v15, 6, v0
+                code.push(v_lshlrev_b32(15, inline_u(4), 15));
+                code.push(v_cmp_lt_u32(inline_u(min_active - 1), 2));
+                code.push(s_and_saveexec_b64(4, VCC));
+                code.push(v_readfirstlane_b32(14, 0));
+                code.push(v_cmp_eq_u32(14, 0));
+                code.push(s_and_saveexec_b64(6, VCC));
+                code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+                code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+                code.push(s_or_b64(EXEC_LO, EXEC_LO, 4));
+                code.push(S_ENDPGM);
+                make_cs_program(&code, threads, 0, false)
+            };
+
+        for (label, threads, min_active, mask_63, force_wave64, expected) in [
+            (
+                "32_guard_ge16",
+                [32, 1, 1],
+                16,
+                false,
+                false,
+                vec![
+                    16.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    2.0f32.to_bits(),
+                    3.0f32.to_bits(),
+                ],
+            ),
+            (
+                "64_guard_ge32",
+                [64, 1, 1],
+                32,
+                false,
+                true,
+                vec![
+                    32.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    2.0f32.to_bits(),
+                    3.0f32.to_bits(),
+                ],
+            ),
+            (
+                "64_guard_ge33",
+                [64, 1, 1],
+                33,
+                false,
+                true,
+                vec![
+                    33.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    2.0f32.to_bits(),
+                    3.0f32.to_bits(),
+                ],
+            ),
+            (
+                "128_guard_lane_ge32",
+                [128, 1, 1],
+                32,
+                true,
+                true,
+                vec![
+                    32.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    2.0f32.to_bits(),
+                    3.0f32.to_bits(),
+                    96.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    2.0f32.to_bits(),
+                    3.0f32.to_bits(),
+                ],
+            ),
+        ] {
+            let prog = build_guard_prog(threads, min_active, mask_63, force_wave64);
+            let uav_dwords = expected.len() as u32;
+            run_on_hosts_modes(
+                label,
+                &prog,
+                [1, 1, 1],
+                uav_dwords,
+                &expected,
+                force_wave64,
+                true,
+            );
+        }
+
+        // Combined whole-wave float reduction + uniform-block s_and_saveexec_b64 (tid >= 32):
+        // Half 0 is masked off before the whole-wave section, so sum(33..=64) = 1552.0 and
+        // v_readfirstlane_b32 under the same guard picks lane 32 to write [1552.0, 1.0, 2.0, 3.0].
+        let mut red_code = vec![
+            v_add_nc_u32(2, inline_u(1), 0),
+            v_cvt_f32_u32(2, vgpr(2)),
+            v_cmp_lt_u32(inline_u(31), 0),
+            s_and_saveexec_b64(4, VCC),
+            s_or_saveexec_b64(6, NEG_ONE),
+        ];
+        red_code.extend_from_slice(&v_cndmask_b32(10, inline_u(0), vgpr(2), 6));
+        for shift in [0x111u32, 0x112, 0x114, 0x118] {
+            red_code.extend_from_slice(&dpp_row_shr(0x03, 10, 10, 10, shift, 0xF));
+        }
+        red_code.extend_from_slice(&v_permlanex16_b32(11, 10, NEG_ONE, NEG_ONE));
+        red_code.push(v_add_f32(10, vgpr(10), 11));
+        red_code.extend_from_slice(&v_readlane_b32(12, 10, inline_u(15)));
+        red_code.extend_from_slice(&v_readlane_b32(13, 10, inline_u(63)));
+        red_code.push(v_mov_b32(10, 12));
+        red_code.push(v_add_f32(10, 13, 10));
+        red_code.push(s_mov_b64(EXEC_LO, 6));
+        red_code.push(s_mov_b32(1, inline_u(0)));
+        red_code.extend_from_slice(&s_load_dwordx4(8, 0));
+        red_code.push(v_mov_b32(16, vgpr(10)));
+        for (reg, f) in [(17u32, 1.0f32), (18, 2.0), (19, 3.0)] {
+            red_code.push(v_mov_b32(reg, LIT));
+            red_code.push(f.to_bits());
+        }
+        red_code.push(v_mov_b32(15, inline_u(0)));
+        red_code.push(v_readfirstlane_b32(14, 0));
+        red_code.push(v_cmp_eq_u32(14, 0));
+        red_code.push(s_and_saveexec_b64(6, VCC));
+        red_code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+        red_code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        red_code.push(s_or_b64(EXEC_LO, EXEC_LO, 4));
+        red_code.push(S_ENDPGM);
+        let red_prog = make_cs_program(&red_code, [64, 1, 1], 0, false);
+        let red_expected = [
+            1552.0f32.to_bits(),
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+        ];
+        run_on_hosts_modes(
+            "64_guard_ge32_whole_wave_sum",
+            &red_prog,
+            [1, 1, 1],
+            4,
+            &red_expected,
+            true,
+            true,
+        );
+
+        // Guard with no active lanes (tid >= 64 on [32,1,1] and [64,1,1]) must fall back to lane 0.
+        for (threads, force_wave64) in [([32, 1, 1], false), ([64, 1, 1], true)] {
+            let mut empty_guard = Vec::new();
+            if force_wave64 {
+                empty_guard.extend_from_slice(&v_mbcnt_lo_u32_b32(3, NEG_ONE, inline_u(0)));
+                empty_guard.extend_from_slice(&v_mbcnt_hi_u32_b32(3, NEG_ONE, vgpr(3)));
+            }
+            empty_guard.extend([
+                v_add_nc_u32(2, inline_u(7), 0),
+                v_cmp_lt_u32(inline_u(63), 0),
+                s_and_saveexec_b64(4, VCC),
+                v_readfirstlane_b32(14, 2),
+                s_or_b64(EXEC_LO, EXEC_LO, 4),
+                v_mov_b32(1, 14),
+            ]);
+            emit_uav_store(&mut empty_guard, 1, 0);
+            empty_guard.push(S_ENDPGM);
+            let prog = make_cs_program(&empty_guard, threads, 0, false);
+            let expected = vec![7u32; threads[0] as usize];
+            run_on_hosts_modes(
+                "uniform_guard_empty_fallback_lane0",
+                &prog,
+                [1, 1, 1],
+                threads[0],
+                &expected,
+                force_wave64,
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_wave_section_does_not_swallow_side_effecting_store() {
+        // A buffer_store_dword between s_or_saveexec_b64(-1) and s_mov_b64(exec, saved) must not
+        // be recognized as a pure whole-wave section and dropped; all 64 lanes must write 1..=64.
+        let mut code = vec![
+            s_or_saveexec_b64(4, NEG_ONE),
+            v_add_nc_u32(1, inline_u(1), 0),
+        ];
+        emit_uav_store(&mut code, 1, 0);
+        code.push(s_mov_b64(EXEC_LO, 4));
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [64, 1, 1], 0, false);
+        let expected: Vec<u32> = (1..=64).collect();
+        run_on_hosts_modes(
+            "section_with_uav_store",
+            &prog,
+            [1, 1, 1],
+            64,
+            &expected,
+            false,
+            true,
+        );
     }
 }

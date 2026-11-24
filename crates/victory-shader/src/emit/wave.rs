@@ -143,11 +143,29 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
+        if insts[i + 1..end].iter().any(|inst| !section_allowed(inst)) {
+            i += 1;
+            continue;
+        }
         let shapes = simulate(&insts[i + 1..end], wave, saved);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
     out
+}
+
+fn section_allowed(inst: &Inst) -> bool {
+    match &inst.fields {
+        Fields::Sop { .. } => {
+            let name = inst.name();
+            !matches!(
+                name,
+                "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"
+            ) && !name.starts_with("s_waitcnt")
+        }
+        Fields::Valu(_) => true,
+        _ => false,
+    }
 }
 
 fn saved_code(inst: &Inst) -> u8 {
@@ -325,9 +343,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             };
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
-                let s = l
-                    .and_then(|l| x.get(l as usize).copied())
-                    .unwrap_or(Sym::Unknown);
+                let s = match l.and_then(|l| x.get(l as usize).copied()) {
+                    Some(Sym::Own(_)) | None => Sym::Unknown,
+                    Some(s) => s,
+                };
                 uni.insert(w, s);
             }
             continue;
@@ -363,7 +382,13 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 for l in 0..wave {
                     match dpp_lane(d, l) {
                         Some((src, zero, on)) if src < wave => {
-                            f.push(if zero { Sym::K(0) } else { s[src as usize] });
+                            f.push(if zero {
+                                Sym::K(0)
+                            } else if src != l && matches!(s[src as usize], Sym::Own(_)) {
+                                Sym::Unknown
+                            } else {
+                                s[src as usize]
+                            });
                             if !on {
                                 writes &= !(1u64 << l);
                             }
@@ -423,7 +448,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                             .map(|l| {
                                 let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let src = other | pick;
+                                if src != l && matches!(a[src as usize], Sym::Own(_)) {
+                                    Sym::Unknown
+                                } else {
+                                    a[src as usize]
+                                }
                             })
                             .collect()
                     }
@@ -522,7 +552,7 @@ fn shapes(
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
             op: Some(op),
             src,
@@ -674,6 +704,30 @@ mod tests {
         assert_eq!(
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
+        );
+    }
+
+    #[test]
+    fn sections_reject_side_effects_and_readlane_of_own_vgpr() {
+        let to_bytes =
+            |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let mut store_code = vec![0xBE84_25C1u32]; // s_or_saveexec_b64 s[4:5], -1
+        store_code.extend_from_slice(&[0x4A02_0081]); // v_add_nc_u32 v1, 1, v0
+        store_code.extend_from_slice(&[0xE070_1000, 0x8002_010F]); // buffer_store_dword
+        store_code.extend_from_slice(&[0xBEFE_0404, 0xBF81_0000]); // s_mov_b64 exec, s[4:5]; s_endpgm
+        let p_store = crate::ir::build(&to_bytes(&store_code), true, 16).unwrap();
+        assert!(sections(&p_store, 0).is_empty());
+
+        let mut read_own = vec![0x4A04_0081u32]; // v_add_nc_u32 v2, 1, v0
+        read_own.push(0xBE84_25C1); // s_or_saveexec_b64 s[4:5], -1
+        read_own.extend_from_slice(&[0xD760_000C, 0x0001_4702]); // v_readlane_b32 s12, v2, 35
+        read_own.extend_from_slice(&[0xBEFE_0404, 0x7E02_020C, 0xBF81_0000]); // s_mov_b64 exec, s[4:5]; v_mov_b32 v1, s12; s_endpgm
+        let p_own = crate::ir::build(&to_bytes(&read_own), true, 16).unwrap();
+        let secs = sections(&p_own, 0);
+        let sec = secs.get(&1).expect("section matched");
+        assert!(
+            !sec.shapes.values().any(|sh| matches!(sh, Shape::Value(_))),
+            "v_readlane_b32 of pre-section VGPR must not produce Shape::Value"
         );
     }
 }

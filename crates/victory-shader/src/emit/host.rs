@@ -1514,6 +1514,9 @@ mod tests {
 
     #[test]
     fn recommended_wave64_mode_matches_device_capabilities() {
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (name, h) in Host::all_adapters() {
             let mode = h.recommended_wave64_mode();
             let expected = if h.supports_wave64() {
