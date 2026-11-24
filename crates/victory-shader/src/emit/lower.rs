@@ -7430,12 +7430,7 @@ mod tests {
         // image_store (op 0x08), dim=1 (2D), unorm=1
         // Test 32-bit partial masks (0x1, 0x3, 0x5) and d16 partial mask (0x7).
         for (dmask, d16) in [(0x1u32, false), (0x3, false), (0x5, false), (0x7, true)] {
-            let mimg_w0 = 0xF000_0000
-                | (0x08 << 18)
-                | (u32::from(d16) << 15)
-                | (dmask << 8)
-                | (1 << 7)
-                | (1 << 3);
+            let mimg_w0 = 0xF000_0000 | (0x08 << 18) | (1 << 12) | (dmask << 8) | (1 << 3);
             let words = [
                 // s_mov_b32 s1, 0
                 0xBE81_0380u32,
@@ -7449,7 +7444,7 @@ mod tests {
                 0x7E06_0280,
                 // image_store v[2..], v[0..1], s[4:11]
                 mimg_w0,
-                0x0001_0200,
+                0x0001_0200 | (u32::from(d16) << 31),
                 S_ENDPGM,
             ];
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();

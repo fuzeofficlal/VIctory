@@ -916,6 +916,8 @@ pub enum View<'a> {
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
+    /// A 1x1 RGBA32F texture UAV initialized with one texel.
+    InitializedTextureUav([f32; 4]),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
@@ -1191,12 +1193,38 @@ impl Host {
                         )?;
                         uavs.push((b, None, n, rb));
                     }
-                    View::TextureUav(w, h) => {
+                    View::TextureUav(..) | View::InitializedTextureUav(_) => {
+                        let (w, h, initial) = match *v {
+                            View::TextureUav(w, h) => (w, h, None),
+                            View::InitializedTextureUav(texel) => (1, 1, Some(texel)),
+                            _ => unreachable!(),
+                        };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            if initial.is_some() {
+                                D3D12_RESOURCE_STATE_COPY_DEST
+                            } else {
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                            },
                         )?;
+                        if let Some(texel) = initial {
+                            let staging = upload(&texel.map(f32::to_bits))?;
+                            list.CopyTextureRegion(
+                                &subresource(&t),
+                                0,
+                                0,
+                                0,
+                                &footprint(&staging, w, h),
+                                None,
+                            );
+                            list.ResourceBarrier(&[transition(
+                                &t,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(staging);
+                        }
                         dev.CreateUnorderedAccessView(&t, None, None, at);
                         let pitch = (w * 16).next_multiple_of(256);
                         let rb = make(

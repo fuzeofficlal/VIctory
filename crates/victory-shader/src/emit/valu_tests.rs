@@ -937,3 +937,125 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+fn build_sparse_image_store_cs(dmask: u8, d16: bool, data: [u32; 2]) -> HostShader {
+    let words = [
+        s_mov_b32(1, 0x80), // s[0:1] points to the descriptor table.
+        0xF40C_0100,        // s_load_dwordx8 s[4:11], s[0:1], 0
+        0xFA00_0000,
+        vop1(0x001, 0, 0x80), // v[0:1] = texel (0, 0)
+        vop1(0x001, 1, 0x80),
+        vop1(0x001, 2, 255), // v[2:3] contains the packed source components.
+        data[0],
+        vop1(0x001, 3, 255),
+        data[1],
+        0xF000_0000 | (0x08 << 18) | (1 << 12) | (u32::from(dmask) << 8) | (1 << 3),
+        0x0001_0200 | (u32::from(d16) << 31),
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("sparse image_store should lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).expect("DXIL validation failed");
+        assert_eq!(dxil[4..20], shader.dxil[4..20], "container hash mismatch");
+        eprintln!("mask {dmask:#x}, d16={d16}: DXIL validated");
+    }
+    shader
+}
+
+#[test]
+fn sparse_image_store_overwrites_disabled_channels_with_zero() {
+    let cases = [
+        (
+            0x9,
+            false,
+            [1.5f32.to_bits(), (-2.25f32).to_bits()],
+            [1.5, 0.0, 0.0, -2.25],
+        ),
+        (0xb, true, [0xc000_3e00, 0x0000_4400], [1.5, -2.0, 0.0, 4.0]),
+    ];
+    let shaders = cases.map(|(mask, d16, data, _)| build_sparse_image_store_cs(mask, d16, data));
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (&(mask, d16, _, expected), shader) in cases.iter().zip(&shaders) {
+            let (root, pso) = host.compute_pipeline(shader).expect("compute pipeline");
+            let data = vec![0; shader.user_data_dwords() as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(data))],
+                        views: &[View::InitializedTextureUav([7.0, 8.0, 9.0, 10.0])],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("texture readback");
+            let actual: [u32; 4] = out[0].as_slice().try_into().unwrap();
+            let actual = actual.map(f32::from_bits);
+            eprintln!("{label}: mask {mask:#x}, d16={d16}: {actual:?}");
+            assert_eq!(actual, expected);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
+}
