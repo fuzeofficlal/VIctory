@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod compare;
 mod inspect;
 mod run;
 mod shader;
@@ -85,6 +86,8 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Compare two `translate --list` outputs program by program.
+    Compare { before: PathBuf, after: PathBuf },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -153,6 +156,7 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        Command::Compare { before, after } => compare::run(&before, &after),
         Command::Run {
             exe,
             unimplemented,
