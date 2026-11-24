@@ -292,6 +292,12 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
+/// The original texture format, before host substitutions.
+#[cfg(windows)]
+pub(crate) fn texture_format(this: This) -> u32 {
+    resource(this).desc.format
+}
+
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
