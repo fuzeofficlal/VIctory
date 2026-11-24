@@ -4372,15 +4372,18 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), sign-extended
+        // above a low word, or zero (pad; a sign extension above the high word
+        // adds nothing).
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, 0..=2) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
@@ -4390,15 +4393,20 @@ impl<'a> Lower<'a> {
             _ => self.s.m.i32(0),
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
+        let r = if sext {
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, t, k16)
         } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
+            let x = self.s.m.bin(c, Bin::And, x, low);
+            if high {
+                let o = self.s.m.bin(c, Bin::And, old, low);
+                let x = self.s.m.bin(c, Bin::Shl, x, k16);
+                self.s.m.bin(c, Bin::Or, o, x)
+            } else {
+                let keep = self.s.m.i32(0xFFFF_0000);
+                let o = self.s.m.bin(c, Bin::And, old, keep);
+                self.s.m.bin(c, Bin::Or, o, x)
+            }
         };
         self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
@@ -7417,5 +7425,30 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn sdwa_16bit_reserved_dst_unused_is_refused() {
+        for dst_sel in [4u32, 5, 6] {
+            let words = [
+                0x7E02_0280,                          // v_mov_b32 v1, 0
+                0x7E00_00F9 | 0x053 << 9,             // v_cvt_i16_f16_sdwa v0, v1
+                1 | dst_sel << 8 | 3 << 11 | 4 << 16, // dst_unused = 3 (reserved)
+                0xD834_0000,                          // ds_write_b32 v1, v0
+                0x0000_0001,
+                S_ENDPGM,
+            ];
+            let err = lowers(&words, 1 << 15).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::ShaderError::Unsupported {
+                        what: "an SDWA destination of a 16-bit operation",
+                        ..
+                    }
+                ),
+                "dst_sel={dst_sel} with reserved dst_unused=3 returned {err:?}",
+            );
+        }
     }
 }

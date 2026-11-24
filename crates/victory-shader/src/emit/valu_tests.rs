@@ -937,3 +937,131 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn sdwa_16bit_dst_unused_sext_sign_extends_word0() {
+    let vop1_sdwa = |op: u16, dst_sel: u8, dst_unused: u8, src0_sel: u8| {
+        let w0 = 0x7E00_00F9 | (op as u32) << 9; // vdst = v0
+        let ext = 1 | (dst_sel as u32) << 8 | (dst_unused as u32) << 11 | (src0_sel as u32) << 16;
+        // Preload v0 from v2 so preserve/pad/sext differences in the unused half are observable.
+        build_valu_cs(&[vop1(0x001, 0, vgpr(2)), w0, ext])
+    };
+
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0
+    let cvt_sext = vop1_sdwa(0x053, 4, 1, 4);
+    let sext_cases: &[([u32; 4], u32)] = &[
+        ([0xBC00, 0xDEAD_BEEF, 0, 0], 0xFFFF_FFFF), // -1.0 -> -1
+        ([0xD140, 0xDEAD_BEEF, 0, 0], 0xFFFF_FFD6), // -42.0 -> -42
+        ([0xF800, 0xDEAD_BEEF, 0, 0], 0xFFFF_8000), // -32768.0 -> -32768
+        ([0x0000, 0xDEAD_BEEF, 0, 0], 0x0000_0000), // +0.0 -> 0
+        ([0x8000, 0xDEAD_BEEF, 0, 0], 0x0000_0000), // -0.0 -> 0
+        ([0x3C00, 0xDEAD_BEEF, 0, 0], 0x0000_0001), // +1.0 -> +1
+        ([0x77FF, 0xDEAD_BEEF, 0, 0], 0x0000_7FF0), // +32752.0 -> +32752
+        ([0x7BFF, 0xDEAD_BEEF, 0, 0], 0x0000_7FFF), // +65504.0 clamped -> +32767
+    ];
+    let sext_in: Vec<[u32; 4]> = sext_cases.iter().map(|c| c.0).collect();
+    run_cases(&cvt_sext, &sext_in, |backend, i, inp, got| {
+        let want = sext_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_i16_f16_sdwa({:#06x}, WORD_0, UNUSED_SEXT) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+
+    // v_cvt_norm_i16_f16_sdwa v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+    let norm_sext = vop1_sdwa(0x063, 4, 1, 5);
+    let norm_cases: &[([u32; 4], u32)] = &[
+        ([0xBC00_3C00, 0xDEAD_BEEF, 0, 0], 0xFFFF_8001), // -1.0 -> -32767
+        ([0xB800_3C00, 0xDEAD_BEEF, 0, 0], 0xFFFF_C000), // -0.5 -> -16384
+        ([0x3C00_BC00, 0xDEAD_BEEF, 0, 0], 0x0000_7FFF), // +1.0 -> +32767
+    ];
+    let norm_in: Vec<[u32; 4]> = norm_cases.iter().map(|c| c.0).collect();
+    run_cases(&norm_sext, &norm_in, |backend, i, inp, got| {
+        let want = norm_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_norm_i16_f16_sdwa({:#010x}, WORD_0, UNUSED_SEXT) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+
+    // v_add_f16_sdwa v0, v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0 src1_sel:WORD_0
+    let add_w0 = 0x32 << 25 | 2 << 9 | 0xF9;
+    let add_ext = 1 | 4 << 8 | 1 << 11 | 4 << 16 | 4 << 24;
+    let add_sext = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), add_w0, add_ext]);
+    let add_cases: &[([u32; 4], u32)] = &[
+        ([0xBC00, 0xBC00, 0xDEAD_BEEF, 0], 0xFFFF_C000), // -1.0 + -1.0 = -2.0 (0xC000)
+        ([0x3C00, 0x3C00, 0xDEAD_BEEF, 0], 0x0000_4000), // +1.0 + +1.0 = +2.0 (0x4000)
+    ];
+    let add_in: Vec<[u32; 4]> = add_cases.iter().map(|c| c.0).collect();
+    run_cases(&add_sext, &add_in, |backend, i, inp, got| {
+        let want = add_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_add_f16_sdwa({:#06x}, {:#06x}, WORD_0, UNUSED_SEXT) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Other valid (dst_sel, dst_unused) combinations must preserve their RDNA2 behavior.
+    for (mode, dst_sel, dst_unused, inp, want) in [
+        (
+            "WORD_0+PAD",
+            4u8,
+            0u8,
+            [0xBC00, 0xABCD_1234, 0, 0],
+            0x0000_FFFFu32,
+        ),
+        (
+            "WORD_0+PRESERVE",
+            4,
+            2,
+            [0xBC00, 0xABCD_1234, 0, 0],
+            0xABCD_FFFF,
+        ),
+        (
+            "WORD_1+PAD(-1)",
+            5,
+            0,
+            [0xBC00, 0xABCD_1234, 0, 0],
+            0xFFFF_0000,
+        ),
+        (
+            "WORD_1+SEXT(-1)",
+            5,
+            1,
+            [0xBC00, 0xABCD_1234, 0, 0],
+            0xFFFF_0000,
+        ),
+        (
+            "WORD_1+SEXT(+1)",
+            5,
+            1,
+            [0x3C00, 0xABCD_1234, 0, 0],
+            0x0001_0000,
+        ),
+        (
+            "WORD_1+PRESERVE(+1)",
+            5,
+            2,
+            [0x3C00, 0xABCD_1234, 0, 0],
+            0x0001_1234,
+        ),
+        (
+            "DWORD+PAD(-1)",
+            6,
+            0,
+            [0xBC00, 0xABCD_1234, 0, 0],
+            0x0000_FFFF,
+        ),
+    ] {
+        let cs = vop1_sdwa(0x053, dst_sel, dst_unused, 4);
+        run_cases(&cs, &[inp], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: v_cvt_i16_f16_sdwa[{mode}] = {got:#010x}, want {want:#010x}",
+            );
+        });
+    }
+}
