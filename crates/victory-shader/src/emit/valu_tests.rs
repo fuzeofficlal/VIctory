@@ -336,6 +336,52 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 #[test]
+fn max_and_min_f16_order_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0, 0x8000);
+    let cases = [
+        // Equal-sign controls.
+        [pz, pz, pz, 0],
+        [nz, nz, nz, 0],
+        // Both operand orders of +0/-0 in the first two operands.
+        [nz, pz, nz, 0],
+        [pz, nz, nz, 0],
+        [nz, pz, pz, 0],
+        [pz, nz, pz, 0],
+        // Only the third operand sign differs.
+        [pz, pz, nz, 0],
+        [nz, nz, pz, 0],
+    ];
+    let ops = [
+        ("v_max_f16", 0x139, 2, true),
+        ("v_min_f16", 0x13a, 2, false),
+        ("v_max3_f16", 0x354, 3, true),
+        ("v_min3_f16", 0x351, 3, false),
+    ];
+    for (name, opcode, sources, is_max) in ops {
+        let src2 = if sources == 3 { vgpr(3) } else { 0 };
+        let words = vop3(opcode, 0, vgpr(1), vgpr(2), src2);
+        let code: Vec<u8> = [words[0], words[1], S_ENDPGM]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let decoded = crate::gfx10::decode(&code).expect("decode VOP3 instruction");
+        assert_eq!(decoded[0].name(), Some(name));
+
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            let operands = &inputs[..sources];
+            let negative = if is_max {
+                operands.iter().all(|&value| value == nz)
+            } else {
+                operands.contains(&nz)
+            };
+            let want = if negative { nz } else { pz };
+            assert_eq!(got & 0xFFFF, want, "{backend}: {name} {operands:x?}");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
