@@ -573,6 +573,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        Ok(self.draw_targets(root, pso, d, &[None])?.remove(0))
+    }
+
+    /// Draws into one RGBA32F target per entry and reads them in binding order.
+    pub(super) fn draw_targets(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        clears: &[Option<[f32; 4]>],
+    ) -> Result<Vec<Vec<[f32; 4]>>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -637,24 +648,37 @@ impl Host {
                 .map_err(err)?;
                 r.ok_or_else(|| "no resource".to_string())
             };
-            let target = make(
-                D3D12_HEAP_TYPE_DEFAULT,
-                &tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                Some(&D3D12_CLEAR_VALUE {
-                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                    Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
-                }),
-            )?;
             let rtv_heap: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                    NumDescriptors: 1,
+                    NumDescriptors: clears.len() as u32,
                     ..Default::default()
                 })
                 .map_err(err)?;
-            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
-            dev.CreateRenderTargetView(&target, None, rtv);
+            let first_rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            let rtv_step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            let mut targets = Vec::with_capacity(clears.len());
+            for (index, clear) in clears.iter().enumerate() {
+                let target = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    Some(&D3D12_CLEAR_VALUE {
+                        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        Anonymous: D3D12_CLEAR_VALUE_0 {
+                            Color: clear.unwrap_or([0.0; 4]),
+                        },
+                    }),
+                )?;
+                let rtv = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: first_rtv.ptr + index * rtv_step as usize,
+                };
+                dev.CreateRenderTargetView(&target, None, rtv);
+                if let Some(clear) = clear {
+                    list.ClearRenderTargetView(rtv, clear, None);
+                }
+                targets.push(target);
+            }
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -786,7 +810,7 @@ impl Host {
                     Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
-            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.OMSetRenderTargets(clears.len() as u32, Some(&first_rtv), true, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -815,42 +839,46 @@ impl Host {
             } else {
                 list.DrawInstanced(3, 1, 0, 0);
             }
-            list.ResourceBarrier(&[transition(
-                &target,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
             let pitch = (w as usize * 16).next_multiple_of(256);
-            let readback = make(
-                D3D12_HEAP_TYPE_READBACK,
-                &buf_desc((pitch * h as usize) as u64),
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-            )?;
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&readback),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: pitch as u32,
+            let mut readbacks = Vec::with_capacity(targets.len());
+            for target in &targets {
+                list.ResourceBarrier(&[transition(
+                    target,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let readback = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buf_desc((pitch * h as usize) as u64),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                Width: w,
+                                Height: h,
+                                Depth: 1,
+                                RowPitch: pitch as u32,
+                            },
                         },
                     },
-                },
-            };
-            let src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&target),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
-                },
-            };
-            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(target),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                readbacks.push(readback);
+            }
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
@@ -867,19 +895,23 @@ impl Host {
             if let Err(e) = dev.GetDeviceRemovedReason() {
                 return Err(format!("device removed: {}", err(e)));
             }
-            let mut p = std::ptr::null_mut();
-            readback.Map(0, None, Some(&mut p)).map_err(err)?;
-            let mut out = Vec::with_capacity((w * h) as usize);
-            for y in 0..h as usize {
-                let row = std::slice::from_raw_parts(
-                    p.cast::<u8>().add(y * pitch).cast::<[f32; 4]>(),
-                    w as usize,
-                );
-                out.extend_from_slice(row);
+            let mut images = Vec::with_capacity(readbacks.len());
+            for readback in &readbacks {
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut p)).map_err(err)?;
+                let mut pixels = Vec::with_capacity((w * h) as usize);
+                for y in 0..h as usize {
+                    let row = std::slice::from_raw_parts(
+                        p.cast::<u8>().add(y * pitch).cast::<[f32; 4]>(),
+                        w as usize,
+                    );
+                    pixels.extend_from_slice(row);
+                }
+                readback.Unmap(0, None);
+                images.push(pixels);
             }
-            readback.Unmap(0, None);
             drop(keep);
-            Ok(out)
+            Ok(images)
         }
     }
 }

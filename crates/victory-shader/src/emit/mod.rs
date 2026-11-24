@@ -759,6 +759,22 @@ mod tests {
             0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
             0xBF81_0000, // s_endpgm
         ];
+        let emitted = emit_test_pixel(&words, 1).unwrap();
+
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut emitted.dxil.clone()).unwrap();
+        }
+        #[cfg(not(windows))]
+        drop(emitted);
+    }
+
+    fn emit_test_pixel(
+        words: &[u32],
+        targets: u32,
+    ) -> Result<super::HostShader, crate::ShaderError> {
         let native = super::NativeProgram {
             stage: super::HwStage::Ps,
             wave64: false,
@@ -798,7 +814,14 @@ mod tests {
             half: false,
         };
         let isg1 = super::container::signature(&[position], true);
-        let osg1 = super::container::signature(&[target], false);
+        let outputs: Vec<_> = (0..targets)
+            .map(|index| SigElement {
+                index,
+                row: Some(index),
+                ..target.clone()
+            })
+            .collect();
+        let osg1 = super::container::signature(&outputs, false);
         let bytes =
             crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
         let c = super::Container::parse(&bytes).unwrap();
@@ -806,15 +829,113 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
-        let emitted = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        super::emit(&c, &native, &p, &st, &io, &res)
+    }
 
-        #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
+    #[cfg(windows)]
+    #[test]
+    fn conditional_exports_rasterize_each_half_to_the_right_target() {
+        use super::diff_tests::{compile, pc_dxc};
+        use super::host::{Draw, Host};
+
+        let Some(dxc) = pc_dxc() else {
+            eprintln!("no PC DXC; skipped");
+            return;
+        };
+        let words = [
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7C08_00F4, // v_cmp_gt_f32 vcc_lo, 2.0, v0 (SV_Position.x)
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xF800_000F,
+            0x0102_0201, // exp mrt0, v1, v2, v2, v1 (red)
+            0xBF8C_0000, // wait before changing EXEC
+            0x897E_007E, // s_xor_b32 exec_lo, exec_lo, s0 (right half)
+            0xF800_000F,
+            0x0102_0102, // exp mrt0, v2, v1, v2, v1 (green)
+            0xBF8C_0000,
+            0x887E_007E, // restore the original EXEC
+            0xF800_181F,
+            0x0101_0202, // exp mrt1, v2, v2, v1, v1 done vm (blue)
+            0xBF81_0000,
+        ];
+        let translated = emit_test_pixel(&words, 2).expect("conditional exports should lower");
+        if let Ok(mut validator) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut emitted.dxil.clone()).unwrap();
+            let mut dxil = translated.dxil.clone();
+            validator.validate(&mut dxil).unwrap();
+            assert_eq!(dxil[4..20], translated.dxil[4..20], "container hash");
+            eprintln!("conditional pixel shader: DXIL validated");
         }
-        #[cfg(not(windows))]
-        drop(emitted);
+        const REFERENCE: &str = r#"
+float4 full_triangle(uint id : SV_VertexID) : SV_Position {
+    const float2 positions[3] = { float2(-1,-1), float2(-1,3), float2(3,-1) };
+    return float4(positions[id], 0, 1);
+}
+struct Targets {
+    float4 color : SV_Target0;
+    float4 control : SV_Target1;
+};
+Targets reference_ps(float4 position : SV_Position) {
+    Targets o;
+    o.color = position.x < 2.0 ? float4(1,0,0,1) : float4(0,1,0,1);
+    o.control = float4(0,0,1,1);
+    return o;
+}
+"#;
+        let dir = std::env::temp_dir().join(format!("victory-conditional-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let vs = compile(&dxc, &dir, REFERENCE, "full_triangle", "vs_6_6");
+        let reference = compile(&dxc, &dir, REFERENCE, "reference_ps", "ps_6_6");
+        for file in ["t.hlsl", "full_triangle.bin", "reference_ps.bin"] {
+            std::fs::remove_file(dir.join(file)).unwrap();
+        }
+        std::fs::remove_dir(&dir).unwrap();
+
+        const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+        const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+        const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+        let expected = vec![
+            vec![RED, RED, GREEN, GREEN, RED, RED, GREEN, GREEN],
+            vec![BLUE; 8],
+        ];
+        let d = Draw {
+            roots: Vec::new(),
+            textures: &[],
+            samplers: &[],
+            vertices: &[],
+            stride: 0,
+            size: (4, 2),
+            mesh_groups: 0,
+        };
+        let clears = [Some([0.25; 4]), Some([0.5; 4])];
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pc = host
+                .pipeline_with(&root, &vs, &reference)
+                .expect("reference PSO");
+            let lowered = host
+                .pipeline_with(&root, &vs, &translated.dxil)
+                .expect("translated PSO");
+            let reference_pixels = host.draw_targets(&root, &pc, &d, &clears).unwrap();
+            let translated_pixels = host.draw_targets(&root, &lowered, &d, &clears).unwrap();
+            assert_eq!(reference_pixels, expected, "{label}: reference coverage");
+            assert_eq!(
+                translated_pixels, reference_pixels,
+                "{label}: conditional export"
+            );
+            eprintln!("{label}: MRT0 red/green split and MRT1 blue across all eight pixels");
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
     }
 }
