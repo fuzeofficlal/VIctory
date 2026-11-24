@@ -328,6 +328,15 @@ pub fn mesh_output_bytes(container: &[u8]) -> Result<Option<u32>, ShaderError> {
 /// shader that writes its vertices and triangles to buffers, and the
 /// vertex shader that draws them ([`MeshFallback`]).
 pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, ShaderError> {
+    translate_mesh_as_compute_with(container, TranslateOptions::default())
+}
+
+/// Translates the mesh program of a console shader container as a compute
+/// fallback using `options`.
+pub fn translate_mesh_as_compute_with(
+    container: &[u8],
+    options: TranslateOptions,
+) -> Result<MeshFallback, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -345,11 +354,11 @@ pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, Shade
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_mesh_as_compute(&c, &native, &p, &st, &io, &res)
+    emit_mesh_as_compute_with(&c, &native, &p, &st, &io, &res, options)
 }
 
 /// [`translate_mesh_as_compute`] for a program whose earlier stages already
-/// ran.
+/// ran with default options.
 pub fn emit_mesh_as_compute(
     c: &Container,
     native: &NativeProgram,
@@ -358,22 +367,27 @@ pub fn emit_mesh_as_compute(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<MeshFallback, ShaderError> {
+    emit_mesh_as_compute_with(c, native, p, st, io, res, TranslateOptions::default())
+}
+
+/// [`translate_mesh_as_compute_with`] for a program whose earlier stages
+/// already ran.
+pub fn emit_mesh_as_compute_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: TranslateOptions,
+) -> Result<MeshFallback, ShaderError> {
     let crate::native::StageIo::Ms(ms) = &native.io else {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "a mesh program run as compute that is no mesh program",
         });
     };
-    let (compute, outputs, prims) = emit_parts(
-        c,
-        native,
-        p,
-        st,
-        io,
-        res,
-        TranslateOptions::default(),
-        true,
-    )?;
+    let (compute, outputs, prims) = emit_parts(c, native, p, st, io, res, options, true)?;
     let layout = MeshLayout {
         threads: ms.threads,
         max_vertices: ms.max_vertices,
@@ -486,7 +500,14 @@ fn emit_parts(
     res: &resource::Resources,
     options: TranslateOptions,
     mesh_as_compute: bool,
-) -> Result<(HostShader, Vec<container::SigElement>, Vec<container::SigElement>), ShaderError> {
+) -> Result<
+    (
+        HostShader,
+        Vec<container::SigElement>,
+        Vec<container::SigElement>,
+    ),
+    ShaderError,
+> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),

@@ -117,17 +117,13 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// A container's mesh program run as compute (hosts without mesh shaders,
 /// issue #3), from the cache when there is one.
 pub(crate) fn mesh_fallback(container: &[u8]) -> Result<MeshFallback, String> {
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_mesh_as_compute(c).map_err(|e| e.to_string());
+    let wave64 = effective_wave64_mode();
+    let options = TranslateOptions { wave64 };
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_mesh_as_compute_with(c, options).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached_as(
-            cache,
-            build(),
-            Wave64Mode::Native,
-            container,
-            &MESH_FALLBACK,
-            translate,
-        ),
+        Some(cache) => cached_as(cache, build(), wave64, container, &MESH_FALLBACK, translate),
         None => translate(container),
     }
 }
@@ -575,6 +571,39 @@ mod tests {
         );
         assert_eq!(get(), Ok(fallback()));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mesh_fallbacks_isolate_wave64_modes_and_preserve_container_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a console mesh container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |c: &[u8]| {
+            assert_eq!(c, container, "33-byte cache prefix must preserve container");
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(fallback())
+        };
+        for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+            assert_eq!(
+                cached_as(&cache, &build, mode, container, &MESH_FALLBACK, translate),
+                Ok(fallback())
+            );
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+
+        for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+            assert_eq!(
+                cached_as(&cache, &build, mode, container, &MESH_FALLBACK, translate),
+                Ok(fallback())
+            );
+        }
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            3,
+            "repeat lookups per Wave64Mode must hit cache"
+        );
     }
 
     #[test]
