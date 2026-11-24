@@ -288,6 +288,15 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+fn unsupported_compute_wave(
+    required_wave: Option<u32>,
+    wave_lanes: Option<(u32, u32)>,
+) -> Option<(u32, u32, u32)> {
+    let req = required_wave?;
+    let (min, max) = wave_lanes?;
+    (!(min..=max).contains(&req)).then_some((req, min, max))
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -419,14 +428,14 @@ impl HostPipeline {
         };
         if let Some(cs) = compute {
             let required_wave = cs.translated().and_then(|t| t.host.required_wave_size());
-            if let (Some(req), Some((_, max))) = (required_wave, host.wave_lanes)
-                && req > max
+            if let Some((req, min, max)) = unsupported_compute_wave(required_wave, host.wave_lanes)
             {
                 tracing::warn!(
                     ?shaders,
                     required_wave = req,
+                    device_min = min,
                     device_max = max,
-                    "compute shader requires wave{req} but host GPU supports up to wave{max}: skipping pipeline creation"
+                    "compute shader requires wave{req} but host GPU supports {min}..={max}. Skipping pipeline creation"
                 );
                 return None;
             }
@@ -675,5 +684,35 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsupported_compute_wave;
+
+    #[test]
+    fn wave_size_precheck_rejects_both_outside_bounds() {
+        assert_eq!(
+            unsupported_compute_wave(Some(32), Some((64, 64))),
+            Some((32, 64, 64)),
+        );
+        assert_eq!(
+            unsupported_compute_wave(Some(64), Some((32, 32))),
+            Some((64, 32, 32)),
+        );
+    }
+
+    #[test]
+    fn wave_size_precheck_accepts_boundaries_or_unknown_constraints() {
+        for supported in [16, 32, 64] {
+            assert_eq!(
+                unsupported_compute_wave(Some(supported), Some((16, 64))),
+                None,
+            );
+        }
+        assert_eq!(unsupported_compute_wave(Some(64), Some((64, 64))), None);
+        assert_eq!(unsupported_compute_wave(None, Some((64, 64))), None);
+        assert_eq!(unsupported_compute_wave(Some(32), None), None);
     }
 }
