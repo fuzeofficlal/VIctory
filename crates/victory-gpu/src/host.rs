@@ -313,6 +313,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Shader-writable memory for what mesh programs run as compute write
+    /// (see [`HostList::mesh_scratch`]), reused after a reset.
+    mesh_scratch: Mutex<MeshScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -392,6 +395,89 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Default-heap memory a list's mesh fallback draws write and read: per
+/// [`ScratchPool`], chunks handed out in order, each draw getting a region
+/// of its own (see [`HostList::mesh_scratch`]).
+#[derive(Default)]
+struct MeshScratch {
+    pools: [Pool; 2],
+}
+
+/// Which memory a mesh fallback draw asks for: what the mesh program writes,
+/// or the commands an indirect draw executes. Kept apart because a draw
+/// moves the chunks it uses between states, and an indirect draw reads its
+/// commands (indirect arguments) while it writes its data (UAV).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScratchPool {
+    Data = 0,
+    Commands = 1,
+}
+
+/// Chunks (buffer, size, bytes used since the reset, used as a UAV since the
+/// reset) and the chunk being filled.
+#[derive(Default)]
+struct Pool {
+    chunks: Vec<(ID3D12Resource, u64, u64, bool)>,
+    current: usize,
+}
+
+/// A mesh fallback chunk's size; bigger regions get a chunk of their own
+/// (a power of two, kept for later draws).
+const MESH_CHUNK: u64 = 64 << 20;
+
+/// A region of a list's mesh fallback memory.
+pub(crate) struct ScratchRegion {
+    pub(crate) buffer: ID3D12Resource,
+    /// Byte offset of the region in `buffer`.
+    pub(crate) offset: u64,
+    /// The list uses `buffer` for the first time since its reset: it is in
+    /// COMMON (new, or decayed after the list last ran) and must move to
+    /// UNORDERED_ACCESS first. Otherwise it is in UNORDERED_ACCESS.
+    pub(crate) first: bool,
+}
+
+impl Pool {
+    /// A region of at least `len` bytes; `make` makes a chunk of a size.
+    fn region(
+        &mut self,
+        len: u64,
+        make: impl FnOnce(u64) -> Option<ID3D12Resource>,
+    ) -> Option<ScratchRegion> {
+        let len = len.max(16).next_multiple_of(256);
+        // The chunk being filled, else the next one big enough (chunks past
+        // the current one are unused since the reset), else a new one.
+        let mut at = self.current;
+        while at < self.chunks.len() {
+            let (_, size, used, _) = &self.chunks[at];
+            if used + len <= *size {
+                break;
+            }
+            at += 1;
+        }
+        if at == self.chunks.len() {
+            let size = MESH_CHUNK.max(len.next_power_of_two());
+            self.chunks.push((make(size)?, size, 0, false));
+        }
+        self.current = at;
+        let (buffer, _, used, touched) = &mut self.chunks[at];
+        let region = ScratchRegion {
+            buffer: buffer.clone(),
+            offset: *used,
+            first: !*touched,
+        };
+        *used += len;
+        *touched = true;
+        Some(region)
+    }
+
+    fn reset(&mut self) {
+        for (_, _, used, touched) in &mut self.chunks {
+            (*used, *touched) = (0, false);
+        }
+        self.current = 0;
+    }
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -475,6 +561,19 @@ impl Host {
         })
     }
 
+    /// Whether mesh pipelines run their mesh program as compute and draw
+    /// what it wrote with a vertex shader (issue #3): on hosts without mesh
+    /// shaders, or everywhere with `VICTORY_MESH_FALLBACK=1` (to compare).
+    pub(crate) fn mesh_fallback(&self) -> bool {
+        static FALLBACK: OnceLock<bool> = OnceLock::new();
+        *FALLBACK.get_or_init(|| {
+            let forced = std::env::var("VICTORY_MESH_FALLBACK").is_ok_and(|v| v == "1");
+            let fallback = forced || !self.mesh_shaders();
+            tracing::info!(fallback, forced, "mesh programs run as compute");
+            fallback
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -503,6 +602,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                mesh_scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -915,6 +1015,12 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        self.mesh_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pools
+            .iter_mut()
+            .for_each(Pool::reset);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1131,6 +1237,25 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// A region of at least `len` bytes (256-byte aligned) of the list's
+    /// shader-writable mesh fallback memory in `pool`, for one draw, which no
+    /// other draw of the list gets until the list is reset.
+    ///
+    /// The chunks of a pool stay in UNORDERED_ACCESS between draws: the
+    /// draw moves its chunk out of it for its reads and back after them
+    /// (first from COMMON, when [`ScratchRegion::first`]). A chunk's
+    /// transitions cover the whole chunk; regions of earlier draws are only
+    /// read by those draws, which the transitions order before later writes.
+    /// After the list runs the chunks decay to COMMON, as buffers do.
+    pub(crate) fn mesh_scratch(&self, len: u64, pool: ScratchPool) -> Option<ScratchRegion> {
+        let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        s.pools[pool as usize].region(len, |size| {
+            let buffer = host()?.uav_buffer(size)?;
+            name(&buffer, || format!("mesh fallback {pool:?} {size:#x}"));
+            Some(buffer)
+        })
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -1418,6 +1543,46 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
+    /// A buffer in the default heap that shaders may write, in COMMON state
+    /// (buffers are promoted from there on first use).
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        if let Err(e) = made {
+            tracing::warn!(size, error = %e, "no shader-writable buffer");
+            return None;
+        }
+        buffer
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -2077,5 +2242,88 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod mesh_scratch {
+    use super::{MESH_CHUNK, Pool};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    /// A small buffer standing for a chunk (the pool only keeps it).
+    fn buffer(device: &ID3D12Device) -> ID3D12Resource {
+        let mut r: Option<ID3D12Resource> = None;
+        // SAFETY: a plain buffer creation.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+        }
+        r.unwrap()
+    }
+
+    #[test]
+    fn draws_get_their_own_regions_and_chunks_come_back_after_a_reset() {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain device creation with a valid out pointer.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        }
+        let device = device.unwrap();
+        let mut made = Vec::new();
+        let mut pool = Pool::default();
+        let mut region = |pool: &mut Pool, len| {
+            pool.region(len, |size| {
+                made.push(size);
+                Some(buffer(&device))
+            })
+            .unwrap()
+        };
+        let same = |a: &super::ScratchRegion, b: &super::ScratchRegion| {
+            a.buffer.as_raw() == b.buffer.as_raw()
+        };
+        let a = region(&mut pool, 1000);
+        let b = region(&mut pool, 300);
+        assert_eq!((a.offset, a.first), (0, true));
+        // 256-byte aligned after the first; the chunk is already a UAV.
+        assert_eq!((b.offset, b.first), (1024, false));
+        assert!(same(&a, &b));
+        // Bigger than a chunk: one of its own, a power of two.
+        let big = region(&mut pool, 100 << 20);
+        assert_eq!((big.offset, big.first), (0, true));
+        assert!(!same(&a, &big));
+        let after = region(&mut pool, 10);
+        assert_eq!((after.offset, after.first), (100 << 20, false));
+        // After a reset the first chunk serves again, from COMMON.
+        pool.reset();
+        let again = region(&mut pool, 10);
+        assert_eq!((again.offset, again.first), (0, true));
+        assert!(same(&a, &again));
+        assert_eq!(made, [MESH_CHUNK, 128 << 20]);
     }
 }

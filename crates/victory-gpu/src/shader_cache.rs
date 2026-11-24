@@ -14,7 +14,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, TranslateOptions, UserData, Wave64Mode};
+use victory_shader::emit::{
+    HostShader, MeshFallback, MeshLayout, StaticSampler, TranslateOptions, UserData, Wave64Mode,
+};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -112,16 +114,54 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// A container's mesh program run as compute (hosts without mesh shaders,
+/// issue #3), from the cache when there is one.
+pub(crate) fn mesh_fallback(container: &[u8]) -> Result<MeshFallback, String> {
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_mesh_as_compute(c).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => cached_as(
+            cache,
+            build(),
+            Wave64Mode::Native,
+            container,
+            &MESH_FALLBACK,
+            translate,
+        ),
+        None => translate(container),
+    }
+}
+
+/// How one kind of entry is named and written.
+struct Kind<T> {
+    id: &'static str,
+    encode: fn(&T) -> Vec<u8>,
+    decode: fn(&[u8]) -> Option<T>,
+}
+
+const SHADER: Kind<HostShader> = Kind {
+    id: "shader.dxil",
+    encode,
+    decode,
+};
+
+const MESH_FALLBACK: Kind<MeshFallback> = Kind {
+    id: "shader.mesh-fallback",
+    encode: encode_fallback,
+    decode: decode_fallback,
+};
+
 /// The cache entry's converter: the build, the lowering mode and the
 /// container in, the encoded translation out. `ran` tells a miss from a hit.
-struct Translate<F> {
+struct Translate<'k, F, T> {
     translate: F,
+    kind: &'k Kind<T>,
     ran: AtomicBool,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<T, String> + Send + Sync, T> Converter for Translate<'_, F, T> {
     fn id(&self) -> &'static str {
-        "shader.dxil"
+        self.kind.id
     }
     fn version(&self) -> u32 {
         // The build fingerprint in the input does the versioning.
@@ -129,8 +169,8 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[33..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let value = (self.translate)(&input[33..]).map_err(anyhow::Error::msg)?;
+        Ok((self.kind.encode)(&value))
     }
 }
 
@@ -141,17 +181,29 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    cached_as(cache, build, mode, container, &SHADER, translate)
+}
+
+fn cached_as<T>(
+    cache: &Cache,
+    build: &[u8; 32],
+    mode: Wave64Mode,
+    container: &[u8],
+    kind: &Kind<T>,
+    translate: impl Fn(&[u8]) -> Result<T, String> + Send + Sync,
+) -> Result<T, String> {
     let mb = [mode_byte(mode)];
     let input = [&build[..], &mb[..], container].concat();
     let converter = Translate {
         translate,
+        kind,
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| (kind.decode)(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -314,6 +366,69 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     })
 }
 
+const FALLBACK_MAGIC: &[u8; 4] = b"VMF1";
+
+/// The compute and vertex shaders as [`encode`]s, length-prefixed, then
+/// `expanded` and the layout's words.
+fn encode_fallback(f: &MeshFallback) -> Vec<u8> {
+    let mut out = FALLBACK_MAGIC.to_vec();
+    for s in [&f.compute, &f.vertex] {
+        let bytes = encode(s);
+        out.extend((bytes.len() as u32).to_le_bytes());
+        out.extend(bytes);
+    }
+    let l = &f.layout;
+    for v in [
+        u32::from(f.expanded),
+        l.threads,
+        l.max_vertices,
+        l.max_primitives,
+        l.vertex_dwords,
+        l.primitive_dwords,
+    ] {
+        out.extend(v.to_le_bytes());
+    }
+    out
+}
+
+fn decode_fallback(bytes: &[u8]) -> Option<MeshFallback> {
+    let mut rest = bytes.strip_prefix(FALLBACK_MAGIC)?;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let (head, tail) = rest.split_at_checked(n)?;
+        rest = tail;
+        Some(head)
+    };
+    let word = |b: &[u8]| -> Option<u32> { Some(u32::from_le_bytes(b.try_into().ok()?)) };
+    let n = word(take(4)?)? as usize;
+    let compute = decode(take(n)?)?;
+    let n = word(take(4)?)? as usize;
+    let vertex = decode(take(n)?)?;
+    let mut words = [0u32; 6];
+    for w in &mut words {
+        *w = word(take(4)?)?;
+    }
+    let [
+        expanded,
+        threads,
+        max_vertices,
+        max_primitives,
+        vertex_dwords,
+        primitive_dwords,
+    ] = words;
+    (rest.is_empty() && expanded <= 1).then_some(MeshFallback {
+        compute,
+        vertex,
+        expanded: expanded == 1,
+        layout: MeshLayout {
+            threads,
+            max_vertices,
+            max_primitives,
+            vertex_dwords,
+            primitive_dwords,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +520,70 @@ mod tests {
             }
         }
         files
+    }
+
+    fn fallback() -> MeshFallback {
+        let mut vertex = shader();
+        vertex.stage = HwStage::Vs;
+        MeshFallback {
+            compute: HostShader {
+                stage: HwStage::Ms,
+                ..shader()
+            },
+            vertex,
+            expanded: true,
+            layout: MeshLayout {
+                threads: 64,
+                max_vertices: 64,
+                max_primitives: 126,
+                vertex_dwords: 12,
+                primitive_dwords: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn mesh_fallbacks_come_back_from_the_cache_apart_from_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(fallback())
+        };
+        let get = || {
+            cached_as(
+                &cache,
+                &build,
+                Wave64Mode::Native,
+                container,
+                &MESH_FALLBACK,
+                translate,
+            )
+        };
+        assert_eq!(get(), Ok(fallback()));
+        assert_eq!(get(), Ok(fallback()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
+        // The same container's plain translation is an entry of its own.
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, container, |_| Ok(
+                shader()
+            )),
+            Ok(shader())
+        );
+        assert_eq!(get(), Ok(fallback()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mesh_fallback_entries_round_trip_and_reject_damage() {
+        let bytes = encode_fallback(&fallback());
+        assert_eq!(decode_fallback(&bytes), Some(fallback()));
+        assert_eq!(decode_fallback(&bytes[..bytes.len() - 1]), None);
+        assert_eq!(decode_fallback(&[bytes.as_slice(), &[0]].concat()), None);
+        assert_eq!(decode_fallback(&encode(&shader())), None);
     }
 
     #[test]

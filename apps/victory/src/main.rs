@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod mesh_census;
 mod run;
 mod shader;
 mod translate;
@@ -85,6 +86,10 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Count what the mesh programs found are made of (group sizes, wave64,
+    /// LDS, barriers, lane reads) and how they translate, as a mesh shader
+    /// and as compute. Prints counts only.
+    MeshCensus { paths: Vec<PathBuf> },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -153,6 +158,7 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        Command::MeshCensus { paths } => mesh_census::run(paths),
         Command::Run {
             exe,
             unimplemented,
