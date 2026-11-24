@@ -333,6 +333,10 @@ pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, Shade
 
 /// Translates the mesh program of a console shader container as a compute
 /// fallback using `options`.
+///
+/// `StageIo::Ms` lowering currently ignores `options.wave64` until mesh
+/// wave64 LDS emulation (`#189` follow-on) is integrated; `options` is threaded
+/// through here so callers and caches keep a forward-compatible interface.
 pub fn translate_mesh_as_compute_with(
     container: &[u8],
     options: TranslateOptions,
@@ -372,6 +376,10 @@ pub fn emit_mesh_as_compute(
 
 /// [`translate_mesh_as_compute_with`] for a program whose earlier stages
 /// already ran.
+///
+/// As with [`translate_mesh_as_compute_with`], `StageIo::Ms` lowering currently
+/// ignores `options.wave64` until mesh wave64 LDS emulation (`#189` follow-on)
+/// is integrated.
 pub fn emit_mesh_as_compute_with(
     c: &Container,
     native: &NativeProgram,

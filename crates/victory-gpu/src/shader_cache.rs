@@ -116,6 +116,13 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 
 /// A container's mesh program run as compute (hosts without mesh shaders,
 /// issue #3), from the cache when there is one.
+///
+/// Threads `effective_wave64_mode()` into
+/// [`translate_mesh_as_compute_with`](victory_shader::emit::translate_mesh_as_compute_with)
+/// and the 33-byte `[build, Wave64Mode, container]` cache prefix. `StageIo::Ms`
+/// lowering currently ignores `options.wave64` until mesh wave64 LDS emulation
+/// (`#189` follow-on) is integrated, while the `Wave64Mode` byte keeps disk
+/// cache keys forward-compatible and consistent with `ms.translated()`.
 pub(crate) fn mesh_fallback(container: &[u8]) -> Result<MeshFallback, String> {
     let wave64 = effective_wave64_mode();
     let options = TranslateOptions { wave64 };
