@@ -236,6 +236,19 @@ impl State {
         }
     }
 
+    /// ExecuteIndirect resets the constants it writes. Keep the guest-side
+    /// values in sync so the next bind doesn't restore their old values.
+    fn clear_indirect_constants(&mut self, compute: bool, constants: &[[u32; 4]]) {
+        let roots = self.roots(compute);
+        for &[_, slot, offset, count] in constants {
+            if let Some(Root::Constants(values)) = roots.get_mut(slot as usize) {
+                for value in values.iter_mut().skip(offset as usize).take(count as usize) {
+                    *value = 0;
+                }
+            }
+        }
+    }
+
     pub(crate) fn set_vertex_buffers(&mut self, start: u32, views: &[VertexView]) {
         for (i, v) in views.iter().enumerate() {
             if let Some(slot) = self.vertex.get_mut(start as usize + i) {
@@ -1091,6 +1104,7 @@ impl State {
             )
         };
         crate::indirect::done(list, &args.buffer);
+        self.clear_indirect_constants(kind == DISPATCH, &title_args[..title_args.len() - 1]);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
