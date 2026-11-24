@@ -1248,8 +1248,12 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
     if !out.is_null() {
+        let mut desc = resource(this).desc;
+        if desc.dimension != BUFFER && desc.mip_levels == 0 {
+            desc.mip_levels = mip_count(&desc) as u16;
+        }
         // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+        unsafe { out.write(desc) };
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -1840,5 +1844,241 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn get_desc_reports_expanded_mips_for_rendering_and_queries() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+        };
+
+        struct Held(This);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                resource_release(self.0);
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let allocate = |dimension, width, height, depth, mips, flags, state: D3D12_RESOURCE_STATES| {
+            let is_buffer = dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: dimension,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: depth,
+                MipLevels: mips,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Format: if is_buffer {
+                    DXGI_FORMAT_UNKNOWN
+                } else {
+                    DXGI_FORMAT_R8G8B8A8_UNORM
+                },
+                Layout: if is_buffer {
+                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                } else {
+                    D3D12_TEXTURE_LAYOUT_UNKNOWN
+                },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut output = std::ptr::null();
+            assert_eq!(
+                create_committed(
+                    std::ptr::null(),
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    state.0 as u32,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut output,
+                ),
+                S_OK
+            );
+            Held(output)
+        };
+        let reported_mips = |res: &Held| {
+            let mut desc = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+            let get_desc = slot::<extern "system" fn(This, *mut ResourceDesc)>(res.0, 0x50);
+            get_desc(res.0, desc.as_mut_ptr());
+            // SAFETY: GetDesc writes the full ResourceDesc into uninitialized storage.
+            unsafe { desc.assume_init() }.mip_levels
+        };
+
+        let buf = allocate(
+            D3D12_RESOURCE_DIMENSION_BUFFER,
+            64,
+            1,
+            1,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        assert_eq!(reported_mips(&buf), 1);
+
+        const COLORS: [[f32; 4]; 3] = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+        for (requested, want_mips) in [(2u16, 2u16), (0u16, 3u16)] {
+            let res = allocate(
+                D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                4,
+                4,
+                1,
+                requested,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            );
+            let native = host_resource(res.0).expect("host texture");
+            // SAFETY: live host texture.
+            let native_desc = unsafe { native.GetDesc() };
+            assert_eq!(native_desc.MipLevels, want_mips);
+            let reported = reported_mips(&res);
+            assert_eq!(reported, want_mips);
+
+            let recorded = host.new_list().expect("host command list");
+            let list = &recorded.list;
+            // SAFETY: open list and live texture in RENDER_TARGET state.
+            unsafe {
+                for (mip, color) in COLORS.iter().take(usize::from(reported)).enumerate() {
+                    let rtv_desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV {
+                                MipSlice: mip as u32,
+                                PlaneSlice: 0,
+                            },
+                        },
+                    };
+                    list.ClearRenderTargetView(host.rtv(native, Some(&rtv_desc)), color, None);
+                }
+                list.ResourceBarrier(&[crate::host::transition(
+                    native,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+
+            let count = u32::from(native_desc.MipLevels);
+            let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+            let mut bytes = 0;
+            let mut readback: Option<ID3D12Resource> = None;
+            // SAFETY: live device, texture, and open list in COPY_SOURCE.
+            let readback = unsafe {
+                host.device.GetCopyableFootprints(
+                    &native_desc,
+                    0,
+                    count,
+                    0,
+                    Some(footprints.as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut bytes),
+                );
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_READBACK,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .expect("readback buffer");
+                let readback = readback.expect("readback buffer");
+                for (mip, fp) in footprints.iter().enumerate() {
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(native),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: mip as u32,
+                        },
+                    };
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&readback),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: *fp,
+                        },
+                    };
+                    list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                }
+                readback
+            };
+            recorded.close();
+            assert_eq!(host.log_messages(), None);
+            host.execute(&[&recorded]);
+            assert_eq!(host.log_messages(), None);
+
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: submission has finished and all offsets lie within the footprints.
+            unsafe {
+                readback.Map(0, None, Some(&mut mapped)).expect("map readback");
+                for (layout, color) in footprints.iter().zip(COLORS) {
+                    let f = layout.Footprint;
+                    let expected = color.map(|c| (c * 255.0) as u8);
+                    for y in 0..f.Height {
+                        for x in 0..f.Width {
+                            let at = layout.Offset as usize + (y * f.RowPitch + x * 4) as usize;
+                            let pixel = mapped.cast::<u8>().add(at).cast::<[u8; 4]>().read_unaligned();
+                            assert_eq!(pixel, expected);
+                        }
+                    }
+                }
+                readback.Unmap(0, None);
+            }
+        }
+
+        for (dim, width, height, depth, want) in [
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 8, 1, 1, 4),
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 2, 16, 3),
+            (D3D12_RESOURCE_DIMENSION_TEXTURE3D, 2, 4, 16, 5),
+        ] {
+            let res = allocate(
+                dim,
+                width,
+                height,
+                depth,
+                0,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            let native = host_resource(res.0).expect("host texture");
+            // SAFETY: live host texture.
+            let native_mips = unsafe { native.GetDesc() }.MipLevels;
+            assert_eq!(native_mips, want);
+            assert_eq!(reported_mips(&res), want);
+        }
     }
 }
