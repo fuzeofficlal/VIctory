@@ -766,11 +766,22 @@ extern "system" fn discard_resource(this: This, resource: This, region: *const D
         else {
             return;
         };
-        let Some(state) = list.tracked_texture_state(&copy) else {
-            return;
-        };
         // SAFETY: a live host texture.
         let desc = unsafe { copy.texture.GetDesc() };
+        let tracked = list.tracked_texture_state(&copy);
+        let state = match tracked {
+            Some(state) => state,
+            None if list_type(this) == D3D12_COMMAND_LIST_TYPE_DIRECT.0 as u32 => {
+                if desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                    D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32
+                } else if desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32
+                } else {
+                    return;
+                }
+            }
+            None => return,
+        };
         if !discard_state_allowed(state, desc.Flags.0 as u32) || !region.is_aligned() {
             return;
         }
@@ -809,6 +820,11 @@ extern "system" fn discard_resource(this: This, resource: This, region: *const D
             } {
                 return;
             }
+        }
+        // When discard is the first use, the normal submission prelude
+        // establishes its state before the list executes.
+        if tracked.is_none() {
+            ensure_state(list, resource, state);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("discard resource {resource:?}"));
