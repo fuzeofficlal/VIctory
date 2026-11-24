@@ -1,7 +1,8 @@
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
-//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped.
+//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped, and
+//! recognized root-argument spill loads, which become scalar copies.
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -25,6 +26,8 @@ pub enum Reg {
     S(u8),
     Scc,
     V(u8),
+    /// A root argument's logical user SGPR, addressed through the spill table.
+    Spill(u8),
 }
 
 pub const VCC: u8 = 106;
@@ -40,12 +43,13 @@ pub struct Program {
     pub wave64: bool,
     /// VGPRs v0 up to this exist; bounds M0-relative access.
     pub vgprs: u16,
+    /// The root layout names spill-table arguments.
+    pub spilled: bool,
     /// In code order, then copies made to give every loop one entry; block 0
     /// is the entry.
     pub blocks: Vec<Block>,
-    /// Registers read before any write, with their value on entry: what the
-    /// hardware or a called fetch routine set up (user SGPRs, system values,
-    /// vertex inputs).
+    /// Registers and spill arguments read before any write, with their values
+    /// on entry.
     pub inputs: Vec<(Reg, Value)>,
 }
 
@@ -121,27 +125,24 @@ impl Inst {
 
 /// The first user SGPR that the spill table of root arguments stands for.
 const SPILL_FIRST: u8 = 16;
+const SPILL_END: u8 = 105;
 
-/// Rewrites loads from the spill table (`s[0:1]`, the high dword masked to a
-/// 40-bit address, usually through copies in `s2`/`s3`) into `s_mov_b32` from
-/// the user SGPRs the table's dwords stand for. Only loads with a constant
-/// offset, in code no branch joins after the pointer is set up, are rewritten.
-///
-/// The table holds the arguments as they were on entry, but the program may
-/// have written the SGPRs those dwords stand for by the time it loads them
-/// (a load into `s[8:23]` overwrites what stands for table dwords 0..7). So
-/// the program first copies the user SGPRs it reads into a block of SGPRs it
-/// never uses, and the loads read that block. Without such a block, or when a
-/// branch can return to the entry, nothing is rewritten.
+struct SpillLoad {
+    dst: u8,
+    first: u8,
+    dwords: u8,
+}
+
+/// Recognizes constant-offset loads from the spill table (`s[0:1]`, the high
+/// dword masked to the 40-bit address). Branch targets end pointer tracking.
 fn spill_loads(
-    list: Vec<Instruction>,
+    list: &[Instruction],
     wave64: bool,
-    vgprs: u16,
     code_len: usize,
-) -> Result<Vec<Instruction>, ShaderError> {
+) -> Result<std::collections::BTreeMap<usize, SpillLoad>, ShaderError> {
     use gfx10::Fields::{Smem, Sop, Valu};
     let mut targets = std::collections::BTreeSet::new();
-    for inst in list.iter() {
+    for inst in list {
         let flow = gfx10::control(inst, code_len, |at| {
             list[..list.partition_point(|i| i.offset < at)].last()
         })?;
@@ -149,44 +150,11 @@ fn spill_loads(
             targets.insert(t);
         }
     }
-    let Some(entry) = list.first().map(|i| i.offset) else {
-        return Ok(list);
-    };
-    if targets.contains(&entry) {
-        return Ok(list);
-    }
-    // Every SGPR the program reads or writes, to find a block it never uses.
-    let mut used = [false; 128];
-    for inst in list.iter() {
-        let Some(name) = inst.name() else {
-            return Ok(list);
-        };
-        let Ok(effects) = effects(
-            inst,
-            &inst.fields(wave64),
-            name,
-            1 + u8::from(wave64),
-            vgprs,
-        ) else {
-            return Ok(list);
-        };
-        for reg in effects
-            .into_iter()
-            .flat_map(|(r, w)| r.into_iter().chain(w))
-        {
-            if let Reg::S(c) = reg {
-                used[usize::from(c).min(127)] = true;
-            }
-        }
-    }
-    let original = list.clone();
-    // Where each rewritten copy is in `out`, and the user SGPR it stands for.
-    let mut copies: Vec<(usize, u8)> = Vec::new();
+    let mut loads = std::collections::BTreeMap::new();
     // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
     let mut tag = [0u8; 128];
     tag[0] = 1;
     tag[1] = 2;
-    let mut out = Vec::with_capacity(list.len());
     let scalar = |o: &Operand| match *o {
         Operand::Scalar { code, dwords } if code < 106 => Some((code, dwords.max(1))),
         _ => None,
@@ -215,12 +183,15 @@ fn spill_loads(
             && let Some((dst, n)) = scalar(d)
         {
             let first = u32::from(SPILL_FIRST) + (offset as u32) / 4;
-            if first + u32::from(n) <= 105 {
-                for k in 0..n {
-                    let src = (first + u32::from(k)) as u8;
-                    copies.push((out.len(), src));
-                    out.push(s_mov(dst + k, src, inst.offset)?);
-                }
+            if first + u32::from(n) <= u32::from(SPILL_END) {
+                loads.insert(
+                    inst.offset,
+                    SpillLoad {
+                        dst,
+                        first: first as u8,
+                        dwords: n,
+                    },
+                );
                 for k in 0..n {
                     tag[(dst + k) as usize] = 0;
                 }
@@ -273,49 +244,31 @@ fn spill_loads(
                 tag[k as usize] = 0;
             }
         }
-        out.push(inst);
     }
-    let Some(last) = copies.iter().map(|c| c.1).max() else {
-        return Ok(out);
-    };
-    // A block of SGPRs past the user SGPRs the table stands for that the
-    // program never touches, below VCC.
-    let size = usize::from(last - SPILL_FIRST) + 1;
-    let Some(block) = (usize::from(last) + 1..=usize::from(VCC) - size)
-        .find(|&b| used[b..b + size].iter().all(|u| !u))
-    else {
-        return Ok(original);
-    };
-    let moved = |src: u8| (block + usize::from(src - SPILL_FIRST)) as u8;
-    let mut read: Vec<u8> = copies.iter().map(|c| c.1).collect();
-    read.sort_unstable();
-    read.dedup();
-    for &(at, src) in &copies {
-        let Fields::Sop {
-            dst: Some(Operand::Scalar { code, .. }),
-            ..
-        } = out[at].fields(wave64)
-        else {
-            unreachable!("a copy is an s_mov_b32");
-        };
-        out[at] = s_mov(code, moved(src), out[at].offset)?;
-    }
-    let mut entries = Vec::with_capacity(read.len() + out.len());
-    for &src in &read {
-        entries.push(s_mov(moved(src), src, entry)?);
-    }
-    entries.extend(out);
-    Ok(entries)
+    Ok(loads)
 }
 
-/// `s_mov_b32 s<dst>, s<src>`, placed at `offset`.
-fn s_mov(dst: u8, src: u8, offset: usize) -> Result<Instruction, ShaderError> {
-    let word = 0xBE80_0000 | u32::from(dst) << 16 | 3 << 8 | u32::from(src);
-    let mut bytes = word.to_le_bytes().to_vec();
-    bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
-    let mut one = gfx10::decode(&bytes)?.remove(0);
-    one.offset = offset;
-    Ok(one)
+/// A scalar copy from a logical spill argument into a physical SGPR.
+fn spill_copy(dst: u8, src: u8, offset: usize) -> Inst {
+    Inst {
+        machine: Instruction {
+            offset,
+            encoding: gfx10::Encoding::Sop1,
+            opcode: 3, // s_mov_b32
+            // The logical source is represented in fields rather than an ISA word.
+            words: Vec::new(),
+        },
+        fields: Fields::Sop {
+            dst: Some(Operand::Scalar {
+                code: dst,
+                dwords: 1,
+            }),
+            src: vec![Operand::Spill(src)],
+            imm: None,
+        },
+        reads: vec![(Reg::Spill(src), NONE)],
+        writes: vec![(Reg::S(dst), NONE)],
+    }
 }
 
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
@@ -334,10 +287,12 @@ pub fn build_with(
     vgprs: u16,
     spilled: bool,
 ) -> Result<Program, ShaderError> {
-    let mut list = gfx10::decode(code)?;
-    if spilled {
-        list = spill_loads(list, wave64, vgprs, code.len())?;
-    }
+    let list = gfx10::decode(code)?;
+    let loads = if spilled {
+        spill_loads(&list, wave64, code.len())?
+    } else {
+        std::collections::BTreeMap::new()
+    };
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
@@ -399,7 +354,11 @@ pub fn build_with(
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        if let Some(load) = loads.get(&machine.offset) {
+            blocks[b].insts.extend(
+                (0..load.dwords).map(|k| spill_copy(load.dst + k, load.first + k, machine.offset)),
+            );
+        } else if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
@@ -479,6 +438,7 @@ pub fn build_with(
     Ok(Program {
         wave64,
         vgprs,
+        spilled,
         blocks,
         inputs,
     })
@@ -487,7 +447,8 @@ pub fn build_with(
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
 /// SGPR codes 0-127, SCC, VGPRs 0-255.
-const REGS: usize = 128 + 1 + 256;
+const PHYSICAL_REGS: usize = 128 + 1 + 256;
+const REGS: usize = PHYSICAL_REGS + (SPILL_END - SPILL_FIRST) as usize;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
@@ -495,6 +456,7 @@ fn index(reg: Reg) -> usize {
         Reg::S(c) => usize::from(c),
         Reg::Scc => 128,
         Reg::V(r) => 129 + usize::from(r),
+        Reg::Spill(r) => PHYSICAL_REGS + usize::from(r - SPILL_FIRST),
     }
 }
 
@@ -502,7 +464,8 @@ fn reg_at(i: usize) -> Reg {
     match i {
         0..128 => Reg::S(i as u8),
         128 => Reg::Scc,
-        _ => Reg::V((i - 129) as u8),
+        129..PHYSICAL_REGS => Reg::V((i - 129) as u8),
+        _ => Reg::Spill(SPILL_FIRST + (i - PHYSICAL_REGS) as u8),
     }
 }
 
@@ -1233,6 +1196,7 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
             }
             out.extend((0..dwords).map(|i| Reg::V(reg + i)));
         }
+        Operand::Spill(r) => out.push(Reg::Spill(r)),
         Operand::Const(251) => out.extend((0..lanes).map(|i| Reg::S(VCC + i))),
         Operand::Const(252) => out.extend((0..lanes).map(|i| Reg::S(EXEC + i))),
         Operand::Const(253) => out.push(Reg::Scc),
@@ -1258,7 +1222,7 @@ mod tests {
     }
 
     /// A compute program whose root arguments are in the spill table `s[0:1]`
-    /// points to: the loads become copies of the user SGPRs the dwords stand for.
+    /// points to: the loads become copies of the logical user SGPRs.
     #[test]
     fn spill_table_loads_read_user_sgprs() {
         let code: Vec<u8> = [
@@ -1284,23 +1248,23 @@ mod tests {
         let p = build_with(&code, false, 256, true).unwrap();
         let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
         assert!(!insts.iter().any(|i| i.name().starts_with("s_load")));
-        // Table dwords 4..8 are user SGPRs 20..24.
+        // Table dwords 4..8 are logical user SGPRs 20..24.
         for k in 0..4 {
             assert!(
-                p.inputs.iter().any(|i| i.0 == Reg::S(20 + k)),
-                "s{} read",
-                20 + k
+                p.inputs.iter().any(|i| i.0 == Reg::Spill(20 + k)),
+                "logical spill argument {} read",
+                20 + k,
             );
         }
-        // s2, the four entry copies of s20..s23, the four loaded dwords, s6.
+        // s2, the four loaded dwords, s6.
         assert_eq!(
             insts.iter().filter(|i| i.name() == "s_mov_b32").count(),
-            1 + 4 + 4 + 1
+            1 + 4 + 1
         );
     }
 
     /// A later table load still reads the arguments as they were on entry,
-    /// although an earlier load overwrote the SGPRs its dwords stand for.
+    /// although an earlier load wrote the physical SGPRs with those numbers.
     #[test]
     fn spill_table_loads_read_entry_values() {
         let code: Vec<u8> = [
@@ -1320,16 +1284,14 @@ mod tests {
         let p = build_with(&code, false, 256, true).unwrap();
         let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
         assert!(!insts.iter().any(|i| i.name().starts_with("s_load")));
-        // Table dwords 0..1 and 4..11 are user SGPRs 16..17 and 20..27, all
-        // read on entry.
+        // The two loads read logical user SGPRs 16..17 and 20..27.
         for reg in (16..18).chain(20..28) {
             assert!(
-                p.inputs.iter().any(|i| i.0 == Reg::S(reg)),
-                "s{reg} read on entry"
+                p.inputs.iter().any(|i| i.0 == Reg::Spill(reg)),
+                "logical spill argument {reg} read",
             );
         }
-        // s6 holds what s16 held on entry, not what the first load put there.
-        let entry = input(&p, Reg::S(16));
+        let entry = input(&p, Reg::Spill(16));
         let copied = |v: Value| {
             insts
                 .iter()

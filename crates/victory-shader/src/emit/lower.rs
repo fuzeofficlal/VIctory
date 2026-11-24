@@ -907,12 +907,13 @@ impl<'a> Lower<'a> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
-                Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
+                Reg::S(_) | Reg::Spill(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
+                Reg::Spill(_) => Val::Missing("a spill argument without a root parameter"),
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
@@ -1200,6 +1201,10 @@ impl<'a> Lower<'a> {
             }
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
+                self.i32_of(v)
+            }
+            Operand::Spill(reg) => {
+                let v = inst.read(Reg::Spill(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
             Operand::Const(c) => crate::resource::inline(c)
