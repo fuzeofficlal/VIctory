@@ -568,6 +568,127 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Synthesizes a default shader resource view description for a typeless host
+/// texture when the title omitted `pDesc`. Typed host textures stay `None` so
+/// D3D12 fills in its own defaults.
+fn default_srv_desc(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if !crate::resource::is_typeless(d.Format.0 as u32) {
+        return None;
+    }
+    let mips = u32::from(d.MipLevels);
+    let slices = u32::from(d.DepthOrArraySize);
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT(crate::resource::view_format(resource).unwrap_or(0) as i32),
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if slices <= 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MipLevels: mips,
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 && slices <= 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if slices <= 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: mips,
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
+/// Synthesizes a default unordered access view description (mip 0) for a
+/// typeless host texture when the title omitted `pDesc`.
+fn default_uav_desc(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if !crate::resource::is_typeless(d.Format.0 as u32) || d.SampleDesc.Count > 1 {
+        return None;
+    }
+    let slices = u32::from(d.DepthOrArraySize);
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT(crate::resource::view_format(resource).unwrap_or(0) as i32),
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if slices <= 1 => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if slices <= 1 => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: slices,
+                ..Default::default()
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -577,7 +698,7 @@ fn buffer_uav(
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+    use crate::resource::{DEPTH_FORMATS, concrete_view_format, family, is_typeless};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
@@ -595,8 +716,9 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
+    let depth = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
     // Every family has more than one format, its typeless one first.
-    let typeless = crate::resource::is_typeless(own);
+    let typeless = is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -607,13 +729,16 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        if typeless {
-            if let Some(format) = format {
-                *format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
-                    crate::resource::concrete_srv_format(own) as i32,
-                );
-            }
+        if !typeless {
+            return true;
         }
+        let Some(format) = format else {
+            return false;
+        };
+        let Some(concrete) = concrete_view_format(own, depth, unordered) else {
+            return false;
+        };
+        *format = DXGI_FORMAT(concrete as i32);
         return true;
     }
     if family(view) != family(own) {
@@ -623,10 +748,11 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if let Some(format) = format {
         if !typeless {
             *format = d.Format;
-        } else if crate::resource::is_typeless(view) {
-            *format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
-                crate::resource::concrete_srv_format(view) as i32,
-            );
+        } else {
+            let Some(concrete) = concrete_view_format(view, depth, unordered) else {
+                return false;
+            };
+            *format = DXGI_FORMAT(concrete as i32);
         }
     }
     true
@@ -659,7 +785,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
-                let mut desc = desc.as_ref().map(srv_desc);
+                let mut desc = desc
+                    .as_ref()
+                    .map(srv_desc)
+                    .or_else(|| default_srv_desc(resource, texture));
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -690,7 +819,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
-            let mut desc = desc.as_ref().map(uav_desc);
+            let mut desc = desc
+                .as_ref()
+                .map(uav_desc)
+                .or_else(|| default_uav_desc(resource, texture));
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
@@ -983,5 +1115,371 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn typeless_color_and_depth_views_read_back_through_null_and_typed_descs() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::{Interface, s};
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+
+        let compile_cs = |src: &str| -> (ID3D12RootSignature, ID3D12PipelineState) {
+            let mut code: Option<ID3DBlob> = None;
+            let mut err: Option<ID3DBlob> = None;
+            // SAFETY: `src` lives through `D3DCompile`; output pointers are valid.
+            unsafe {
+                if let Err(e) = D3DCompile(
+                    src.as_ptr().cast(),
+                    src.len(),
+                    s!("typeless_probe"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut err),
+                ) {
+                    let msg = err.map_or_else(String::new, |b| {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(
+                            b.GetBufferPointer().cast::<u8>(),
+                            b.GetBufferSize(),
+                        ))
+                        .into_owned()
+                    });
+                    panic!("D3DCompile failed: {e}: {msg}");
+                }
+                let code = code.unwrap();
+                let bytes = std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+                let pso = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+
+        let make_tex =
+            |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, initial: D3D12_RESOURCE_STATES| {
+                let null = std::ptr::null();
+                let props = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 2,
+                    Height: 2,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let iid = ID3D12Resource::IID;
+                let mut out = null;
+                assert_eq!(
+                    crate::resource::create_committed(
+                        null,
+                        (&raw const props).cast(),
+                        0,
+                        (&raw const desc).cast(),
+                        initial.0 as u32,
+                        null.cast(),
+                        (&raw const iid).cast(),
+                        &mut out,
+                    ),
+                    crate::object::S_OK
+                );
+                out
+            };
+
+        let color_r16 = make_tex(
+            DXGI_FORMAT_R16_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let depth_r16 = make_tex(
+            DXGI_FORMAT_R16_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        );
+        let depth_r24g8 = make_tex(
+            DXGI_FORMAT_R24G8_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        );
+
+        let host_color_r16 = crate::resource::host_resource(color_r16).unwrap();
+        let host_depth_r16 = crate::resource::host_resource(depth_r16).unwrap();
+        let host_depth_r24g8 = crate::resource::host_resource(depth_r24g8).unwrap();
+
+        // Direct `fits` with `None` on a typeless texture must refuse rather than
+        // allowing `None` to reach CreateShaderResourceView.
+        assert!(!fits(host_color_r16, None, false));
+        assert!(!fits(host_depth_r24g8, None, false));
+
+        // Create GPU output and CPU readback buffers for the 4 sampled floats.
+        let make_buf = |heap_type, flags, state| -> ID3D12Resource {
+            let mut buf: Option<ID3D12Resource> = None;
+            // SAFETY: plain committed buffer creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: heap_type,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: 64,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut buf,
+                    )
+                    .unwrap();
+            }
+            buf.unwrap()
+        };
+        let out_buf = make_buf(
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let readback = make_buf(
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+
+        let base = heap.dynamic(8).unwrap();
+        // Slot 0: NULL-desc UAV on non-depth R16_TYPELESS -> R16_FLOAT (preserves > 1.0).
+        heap.make_at(base, &View::Unordered(color_r16 as usize, 0, None));
+        // Slot 1: NULL-desc SRV on non-depth R16_TYPELESS -> R16_FLOAT.
+        heap.make_at(base + 1, &View::Shader(color_r16 as usize, None));
+        // Slot 2: NULL-desc SRV on depth R16_TYPELESS -> R16_UNORM.
+        heap.make_at(base + 2, &View::Shader(depth_r16 as usize, None));
+        // Slot 3: NULL-desc SRV on depth R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS.
+        heap.make_at(base + 3, &View::Shader(depth_r24g8 as usize, None));
+        // Slot 4: Explicit DSV-format (45) SRV on R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS.
+        let dsv_srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: `D3D12_SHADER_RESOURCE_VIEW_DESC` is 40 bytes (`[u32; 10]`).
+        let dsv_srv_words =
+            unsafe { (&raw const dsv_srv_desc).cast::<[u32; 10]>().read_unaligned() };
+        heap.make_at(
+            base + 4,
+            &View::Shader(depth_r24g8 as usize, Some(dsv_srv_words)),
+        );
+        // Slot 5: Raw output UAV buffer.
+        // SAFETY: valid heap slot and live UAV buffer.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &out_buf,
+                None::<&ID3D12Resource>,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: 4,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                heap.cpu(base + 5),
+            );
+        }
+        // Slot 6: Illegal planar depth UAV falls back safely to a null UAV.
+        heap.make_at(base + 6, &View::Unordered(depth_r24g8 as usize, 0, None));
+        assert_eq!(host.log_messages(), None);
+
+        let (write_rs, write_pso) = compile_cs(
+            r#"
+            #define RS "DescriptorTable(UAV(u0))"
+            RWTexture2D<float> out_tex : register(u0);
+            [RootSignature(RS)]
+            [numthreads(1, 1, 1)]
+            void main() {
+                out_tex[uint2(0, 0)] = 1.5;
+            }
+            "#,
+        );
+        let (read_rs, read_pso) = compile_cs(
+            r#"
+            #define RS "DescriptorTable(SRV(t0, numDescriptors = 4), UAV(u0))"
+            Texture2D<float> color_r16 : register(t0);
+            Texture2D<float> depth_r16 : register(t1);
+            Texture2D<float> depth_r24_null : register(t2);
+            Texture2D<float> depth_r24_dsv : register(t3);
+            RWByteAddressBuffer out_buf : register(u0);
+            [RootSignature(RS)]
+            [numthreads(1, 1, 1)]
+            void main() {
+                out_buf.Store(0, asuint(color_r16.Load(int3(0, 0, 0))));
+                out_buf.Store(4, asuint(depth_r16.Load(int3(0, 0, 0))));
+                out_buf.Store(8, asuint(depth_r24_null.Load(int3(0, 0, 0))));
+                out_buf.Store(12, asuint(depth_r24_dsv.Load(int3(0, 0, 0))));
+            }
+            "#,
+        );
+
+        let dsv_r16 = host.dsv(
+            host_depth_r16,
+            Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: DXGI_FORMAT_D16_UNORM,
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            }),
+        );
+        let dsv_r24 = host.dsv(
+            host_depth_r24g8,
+            Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            }),
+        );
+
+        let list = host.new_list().unwrap();
+        // SAFETY: live heap, pipelines, views and barriers on an open command list.
+        unsafe {
+            let gpu_start = heap.heap.GetGPUDescriptorHandleForHeapStart().ptr;
+            let gpu_at = |slot: u32| D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_start + u64::from(slot) * u64::from(heap.step),
+            };
+            list.list
+                .ClearDepthStencilView(dsv_r16, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+            list.list
+                .ClearDepthStencilView(dsv_r24, D3D12_CLEAR_FLAG_DEPTH, 0.75, 0, None);
+
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&write_rs);
+            list.list.SetPipelineState(&write_pso);
+            list.list.SetComputeRootDescriptorTable(0, gpu_at(base));
+            list.list.Dispatch(1, 1, 1);
+
+            list.list.ResourceBarrier(&[
+                crate::host::transition(
+                    host_color_r16,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+                crate::host::transition(
+                    host_depth_r16,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+                crate::host::transition(
+                    host_depth_r24g8,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+            ]);
+
+            list.list.SetComputeRootSignature(&read_rs);
+            list.list.SetPipelineState(&read_pso);
+            list.list.SetComputeRootDescriptorTable(0, gpu_at(base + 1));
+            list.list.Dispatch(1, 1, 1);
+
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &out_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&readback, 0, &out_buf, 0, 16);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: `execute` waited for completion; 16 bytes were copied.
+        let values = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE { Begin: 0, End: 16 }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            let vals = *(mapped as *const [f32; 4]);
+            readback.Unmap(0, None);
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+            vals
+        };
+
+        assert_eq!(values[0], 1.5, "non-depth R16_TYPELESS must use R16_FLOAT");
+        assert!(
+            (values[1] - 0.5).abs() < 1e-3,
+            "depth R16_TYPELESS must use R16_UNORM, got {}",
+            values[1]
+        );
+        assert!(
+            (values[2] - 0.75).abs() < 1e-4,
+            "NULL-desc R24G8_TYPELESS must use R24_UNORM_X8_TYPELESS, got {}",
+            values[2]
+        );
+        assert!(
+            (values[3] - 0.75).abs() < 1e-4,
+            "D24_UNORM_S8_UINT SRV on R24G8_TYPELESS must use R24_UNORM_X8_TYPELESS, got {}",
+            values[3]
+        );
+
+        heap.release(base, 8);
+        // Clear retained host references before releasing title objects.
+        for s in 0..8 {
+            heap.make_null(base + s);
+        }
+        let release = |obj: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(obj, 0x10)(obj)
+        };
+        assert_eq!(release(color_r16), 0);
+        assert_eq!(release(depth_r16), 0);
+        assert_eq!(release(depth_r24g8), 0);
     }
 }

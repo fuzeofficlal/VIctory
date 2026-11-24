@@ -275,24 +275,38 @@ pub(crate) fn family(format: u32) -> u32 {
 
 /// Whether a format is the root typeless format of a multi-format family.
 pub(crate) fn is_typeless(format: u32) -> bool {
-    format != 0 && family(format) == format && family(format + 1) == format
+    format != 0
+        && family(format) == format
+        && format.checked_add(1).is_some_and(|next| family(next) == format)
 }
 
-/// A concrete shader-readable format for a typeless format, resolving depth
-/// families to their legal depth SRV format (not their DSV attachment format)
-/// and color families to their primary typed view format.
-pub(crate) fn concrete_srv_format(format: u32) -> u32 {
-    match format {
-        19 => 21, // R32G8X24_TYPELESS -> R32_FLOAT_X8X24_TYPELESS (depth SRV, not DSV 20)
-        44 => 46, // R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS (depth SRV, not DSV 45)
-        39 => 41, // R32_TYPELESS -> R32_FLOAT (SRV, not DSV 40)
-        53 => 56, // R16_TYPELESS -> R16_UNORM (depth SRV, not DSV 55)
-        90 => 87, // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
-        92 => 88, // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
-        94 => 95, // BC6H_TYPELESS -> BC6H_UF16
+/// A concrete view format for a typeless or depth-attachment format, aware of
+/// whether the resource carries `ALLOW_DEPTH_STENCIL` (`depth`) and whether
+/// the view is unordered access (`unordered`). Returns `None` when the format
+/// has no legal D3D12 view of the requested kind (such as planar depth UAVs).
+pub(crate) fn concrete_view_format(format: u32, depth: bool, unordered: bool) -> Option<u32> {
+    let resolved = match format {
+        19..=21 => (!unordered).then_some(21)?, // R32_FLOAT_X8X24_TYPELESS (SRV only)
+        22 => (!unordered).then_some(22)?,      // X32_TYPELESS_G8X24_UINT (stencil SRV only)
+        44..=46 => (!unordered).then_some(46)?, // R24_UNORM_X8_TYPELESS (SRV only)
+        47 => (!unordered).then_some(47)?,      // X24_TYPELESS_G8_UINT (stencil SRV only)
+        39 | 40 => 41,                          // R32_TYPELESS / D32_FLOAT -> R32_FLOAT
+        53 => {
+            if depth {
+                (!unordered).then_some(56)? // depth R16_TYPELESS -> R16_UNORM
+            } else {
+                54 // color R16_TYPELESS -> R16_FLOAT
+            }
+        }
+        55 => (!unordered).then_some(56)?, // D16_UNORM -> R16_UNORM (SRV only)
+        90 => 87,                          // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
+        88 | 92 => (!unordered).then_some(88)?, // B8G8R8X8 -> B8G8R8X8_UNORM (SRV only)
+        70..=84 | 94..=99 if unordered => return None, // block-compressed formats have no UAV
+        94 => 95,                          // BC6H_TYPELESS -> BC6H_UF16
         f if is_typeless(f) => f + 1,
         f => f,
-    }
+    };
+    Some(resolved)
 }
 
 /// sRGB formats and their linear twins.
@@ -1865,23 +1879,46 @@ mod tests {
     }
 
     #[test]
-    fn concrete_srv_format_resolves_color_and_depth_families() {
-        // Color typeless formats resolve to primary typed view format
-        assert_eq!(concrete_srv_format(27), 28); // R8G8B8A8_TYPELESS -> R8G8B8A8_UNORM
-        assert_eq!(concrete_srv_format(90), 87); // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
-        assert_eq!(concrete_srv_format(92), 88); // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
-        assert_eq!(concrete_srv_format(9), 10); // R16G16B16A16_TYPELESS -> R16G16B16A16_FLOAT
-        assert_eq!(concrete_srv_format(94), 95); // BC6H_TYPELESS -> BC6H_UF16
-        assert_eq!(concrete_srv_format(97), 98); // BC7_TYPELESS -> BC7_UNORM
+    fn concrete_view_format_resolves_color_depth_uav_and_bounds() {
+        assert!(!is_typeless(0));
+        assert!(!is_typeless(u32::MAX));
+        assert!(is_typeless(27));
+        assert!(is_typeless(53));
 
-        // Depth typeless formats resolve to valid SRVs (never DSV attachment formats 20, 45, 40, 55)
-        assert_eq!(concrete_srv_format(19), 21); // R32G8X24_TYPELESS -> R32_FLOAT_X8X24_TYPELESS
-        assert_eq!(concrete_srv_format(44), 46); // R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS
-        assert_eq!(concrete_srv_format(39), 41); // R32_TYPELESS -> R32_FLOAT
-        assert_eq!(concrete_srv_format(53), 56); // R16_TYPELESS -> R16_UNORM
+        // Color typeless formats resolve to primary typed view format.
+        assert_eq!(concrete_view_format(27, false, false), Some(28));
+        assert_eq!(concrete_view_format(27, false, true), Some(28));
+        assert_eq!(concrete_view_format(90, false, false), Some(87));
+        assert_eq!(concrete_view_format(92, false, false), Some(88));
+        assert_eq!(concrete_view_format(92, false, true), None);
+        assert_eq!(concrete_view_format(9, false, false), Some(10));
+        assert_eq!(concrete_view_format(94, false, false), Some(95));
+        assert_eq!(concrete_view_format(94, false, true), None);
+        assert_eq!(concrete_view_format(97, false, false), Some(98));
+        assert_eq!(concrete_view_format(97, false, true), None);
 
-        // Typed formats are preserved untouched
-        assert_eq!(concrete_srv_format(28), 28);
-        assert_eq!(concrete_srv_format(46), 46);
+        // R16_TYPELESS (53) distinguishes depth (R16_UNORM 56) from color/UAV (R16_FLOAT 54).
+        assert_eq!(concrete_view_format(53, true, false), Some(56));
+        assert_eq!(concrete_view_format(53, false, false), Some(54));
+        assert_eq!(concrete_view_format(53, false, true), Some(54));
+        assert_eq!(concrete_view_format(56, false, false), Some(56));
+
+        // Depth typeless and attachment formats resolve to valid SRVs and reject planar UAVs.
+        assert_eq!(concrete_view_format(19, true, false), Some(21));
+        assert_eq!(concrete_view_format(20, true, false), Some(21));
+        assert_eq!(concrete_view_format(19, true, true), None);
+        assert_eq!(concrete_view_format(21, false, true), None);
+        assert_eq!(concrete_view_format(44, true, false), Some(46));
+        assert_eq!(concrete_view_format(45, true, false), Some(46));
+        assert_eq!(concrete_view_format(44, true, true), None);
+        assert_eq!(concrete_view_format(46, false, true), None);
+        assert_eq!(concrete_view_format(39, true, false), Some(41));
+        assert_eq!(concrete_view_format(40, true, false), Some(41));
+        assert_eq!(concrete_view_format(55, true, false), Some(56));
+
+        // Typed formats stay untouched when legal.
+        assert_eq!(concrete_view_format(28, false, false), Some(28));
+        assert_eq!(concrete_view_format(46, true, false), Some(46));
+        assert_eq!(concrete_view_format(47, true, false), Some(47));
     }
 }
