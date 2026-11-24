@@ -487,7 +487,11 @@ fn compute(
 
 /// Records the capture and expansion before the caller rebinds its draw.
 /// The caller restores the output to its reusable state with Expanded::finish.
-pub(crate) fn expand(list: &HostList, draw: &Draw) -> Option<Expanded> {
+pub(crate) fn expand(
+    list: &HostList,
+    source: &ID3D12Resource,
+    draw: &Draw,
+) -> Option<Expanded> {
     let chunks = draw.count.div_ceil(CHUNK_SIZE);
     let captured_bytes = u64::from(draw.count) * 4;
     let counter = captured_bytes.next_multiple_of(8);
@@ -523,6 +527,9 @@ pub(crate) fn expand(list: &HostList, draw: &Draw) -> Option<Expanded> {
         )
     };
 
+    // The original index shadow may have just been written by a compute
+    // shader. Normal tracked buffer reads include the IA index state.
+    list.buffer_state(source, crate::host::BUFFER_READ);
     let l = &list.list;
     // SAFETY: these are live buffers with the documented stable states, and
     // the index buffer is valid for an ordinary IA read on this list.

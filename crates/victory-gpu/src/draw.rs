@@ -994,7 +994,7 @@ impl State {
             if !std::sync::Arc::ptr_eq(&written, &shadow) {
                 return None;
             }
-            let output = crate::topology::expand(list, &crate::topology::Draw {
+            let output = crate::topology::expand(list, &shadow.buffer, &crate::topology::Draw {
                 source: D3D12_INDEX_BUFFER_VIEW {
                     BufferLocation: shadow.gpu(v.address),
                     SizeInBytes: v.size,
