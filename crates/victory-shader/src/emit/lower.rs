@@ -945,6 +945,34 @@ impl<'a> Lower<'a> {
                             || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some()))
                 })
             });
+            let is_non_waterfall_firstlane = |i: &Inst| {
+                i.name() == "v_readfirstlane_b32"
+                    && !i
+                        .writes
+                        .first()
+                        .is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+            };
+            let has_firstlane = insts().any(is_non_waterfall_firstlane);
+            let has_non_uniform_firstlane = if has_firstlane
+                || matches!(req_mode, Wave64Mode::Wave32 | Wave64Mode::Emulate)
+            {
+                (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                has_firstlane
+                    && insts().any(|i| {
+                        is_non_waterfall_firstlane(i)
+                            && matches!(
+                                &i.fields,
+                                Fields::Valu(v)
+                                    if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
+                                        if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
+                            )
+                    })
+            } else {
+                false
+            };
+            if has_non_uniform_firstlane {
+                console_lanes = true;
+            }
 
             match req_mode {
                 Wave64Mode::Native => {
@@ -956,16 +984,6 @@ impl<'a> Lower<'a> {
                 }
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
                     spills = spilled_sgprs(p);
-                    (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
-                    let has_non_uniform_firstlane = insts().any(|i| {
-                        i.name() == "v_readfirstlane_b32"
-                            && matches!(
-                                &i.fields,
-                                Fields::Valu(v)
-                                    if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
-                                        if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
-                            )
-                    });
                     let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
                         blk.insts.iter().enumerate().any(|(i, inst)| {
                             !in_sections(&sections, b, i)

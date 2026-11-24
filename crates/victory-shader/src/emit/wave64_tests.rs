@@ -413,6 +413,54 @@ fn wave_mode_psv_and_flags() {
 }
 
 #[test]
+fn readfirstlane_psv_wave_size_without_mbcnt() {
+    // Non-uniform v_readfirstlane_b32 without v_mbcnt/v_readlane/dpp must still enforce
+    // WaveSize(64) in Wave64Mode::Native so 64-lane waves are not split into Wave32.
+    let mut non_uniform_code = vec![v_readfirstlane_b32(4, 0), v_mov_b32(1, 4)];
+    emit_uav_store(&mut non_uniform_code, 1, 0);
+    non_uniform_code.push(S_ENDPGM);
+    let non_uniform_prog = make_cs_program(&non_uniform_code, [64, 1, 1], 0, false);
+
+    let native = emit_cs(&non_uniform_prog, Wave64Mode::Native).unwrap();
+    assert_eq!(psv_wave_range(&native), (64, 64));
+    assert_ne!(sfi0_flags(&native) & 0x4000, 0);
+
+    let wave32 = emit_cs(&non_uniform_prog, Wave64Mode::Wave32).unwrap();
+    assert_eq!(psv_wave_range(&wave32), (32, 32));
+
+    let emu = emit_cs(&non_uniform_prog, Wave64Mode::Emulate).unwrap();
+    assert_eq!(psv_wave_range(&emu), (0, u32::MAX));
+    assert_eq!(sfi0_flags(&emu) & 0x4000, 0);
+
+    // Uniform v_readfirstlane_b32 without other cross-lane ops does not need WaveSize(64)
+    // in Native or ballot scratch in Wave32/Emulate.
+    let mut uniform_code = vec![
+        s_mov_b32(8, inline_u(42)),
+        v_mov_b32(2, 8),
+        v_readfirstlane_b32(4, 2),
+        v_mov_b32(1, 4),
+    ];
+    emit_uav_store(&mut uniform_code, 1, 0);
+    uniform_code.push(S_ENDPGM);
+    let uniform_prog = make_cs_program(&uniform_code, [64, 1, 1], 0, false);
+
+    let uniform_native = emit_cs(&uniform_prog, Wave64Mode::Native).unwrap();
+    assert_eq!(psv_wave_range(&uniform_native), (0, u32::MAX));
+    assert_eq!(
+        lower_cs(&uniform_prog, Wave64Mode::Wave32)
+            .unwrap()
+            .lds_dwords,
+        0
+    );
+    assert_eq!(
+        lower_cs(&uniform_prog, Wave64Mode::Emulate)
+            .unwrap()
+            .lds_dwords,
+        0
+    );
+}
+
+#[test]
 fn lds_overflow_fails_explicitly() {
     // Title uses full 32 KiB (8192 dwords) of LDS and reads a dynamic lane.
     let mut code = Vec::new();
@@ -1812,6 +1860,97 @@ mod gpu {
             64,
             &expected,
             false,
+            true,
+        );
+    }
+
+    #[test]
+    fn gpu_readfirstlane_native_wave64_without_mbcnt() {
+        // Without v_mbcnt/v_readlane/dpp, non-uniform or guarded v_readfirstlane_b32 on a
+        // [64,1,1] CS must still enforce WaveSize(64) in Wave64Mode::Native so AMD Native
+        // does not split the 64-thread wave into two Wave32 waves.
+        // 1. tid >= 16 uniform-block guard + v_readfirstlane_b32 + 16B UAV write -> [16.0, 1.0, 2.0, 3.0].
+        let mut guard_code = vec![s_mov_b32(1, inline_u(0))];
+        guard_code.extend_from_slice(&s_load_dwordx4(8, 0));
+        guard_code.push(v_cvt_f32_u32(16, vgpr(0)));
+        for (reg, f) in [(17u32, 1.0f32), (18, 2.0), (19, 3.0)] {
+            guard_code.push(v_mov_b32(reg, LIT));
+            guard_code.push(f.to_bits());
+        }
+        guard_code.extend([
+            v_mov_b32(15, inline_u(0)),
+            v_cmp_lt_u32(inline_u(15), 0),
+            s_and_saveexec_b64(4, VCC),
+            v_readfirstlane_b32(14, 0),
+            v_cmp_eq_u32(14, 0),
+            s_and_saveexec_b64(6, VCC),
+        ]);
+        guard_code.extend_from_slice(&buffer_store_dwordx4(16, 15, 8));
+        guard_code.extend([
+            s_or_b64(EXEC_LO, EXEC_LO, 6),
+            s_or_b64(EXEC_LO, EXEC_LO, 4),
+            S_ENDPGM,
+        ]);
+        let guard_prog = make_cs_program(&guard_code, [64, 1, 1], 0, false);
+        let guard_expected = [
+            16.0f32.to_bits(),
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+        ];
+        run_on_hosts_modes(
+            "64_guard_ge16_no_mbcnt",
+            &guard_prog,
+            [1, 1, 1],
+            4,
+            &guard_expected,
+            true,
+            true,
+        );
+
+        // 2. Conditional write under tid >= 32 guard + v_readfirstlane_b32 readback across all
+        // 64 lanes without v_mbcnt -> [99; 64] (Wave32 split would yield [11; 32] + [99; 32]).
+        let mut cond_code = vec![
+            v_mov_b32(2, inline_u(11)),
+            v_cmp_lt_u32(inline_u(31), 0),
+            s_and_saveexec_b64(4, VCC),
+            v_mov_b32(2, LIT),
+            99,
+            v_readfirstlane_b32(14, 2),
+            s_or_b64(EXEC_LO, EXEC_LO, 4),
+            v_mov_b32(1, 14),
+        ];
+        emit_uav_store(&mut cond_code, 1, 0);
+        cond_code.push(S_ENDPGM);
+        let cond_prog = make_cs_program(&cond_code, [64, 1, 1], 0, false);
+        let cond_expected = [99u32; 64];
+        run_on_hosts_modes(
+            "64_cond_write_readfirstlane_no_mbcnt",
+            &cond_prog,
+            [1, 1, 1],
+            64,
+            &cond_expected,
+            true,
+            true,
+        );
+
+        // 3. Unguarded non-uniform v_readfirstlane_b32(v0 + 10) across 64 lanes without v_mbcnt -> [10; 64].
+        let mut unguarded_code = vec![
+            v_add_nc_u32(2, inline_u(10), 0),
+            v_readfirstlane_b32(14, 2),
+            v_mov_b32(1, 14),
+        ];
+        emit_uav_store(&mut unguarded_code, 1, 0);
+        unguarded_code.push(S_ENDPGM);
+        let unguarded_prog = make_cs_program(&unguarded_code, [64, 1, 1], 0, false);
+        let unguarded_expected = [10u32; 64];
+        run_on_hosts_modes(
+            "64_unguarded_readfirstlane_no_mbcnt",
+            &unguarded_prog,
+            [1, 1, 1],
+            64,
+            &unguarded_expected,
+            true,
             true,
         );
     }
