@@ -934,7 +934,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         {
-            self.writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             self.input_traces
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

@@ -296,12 +296,7 @@ extern "system" fn present(
             let desc = unsafe { texture.GetDesc() };
             if listed {
                 crate::capture::present_source(frame, 0, 0, resource, &desc);
-                tracing::info!(
-                    frame,
-                    planes,
-                    sources = 1usize,
-                    "present plane selection"
-                );
+                tracing::info!(frame, planes, sources = 1usize, "present plane selection");
             }
             crate::capture::correlate_present(
                 frame,

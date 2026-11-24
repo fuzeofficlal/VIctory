@@ -981,6 +981,11 @@ impl Drop for Resource {
                 self.data() as u64,
             );
         }
+        #[cfg(feature = "diagnostics")]
+        crate::capture::forget_resource(
+            std::ptr::from_ref::<Resource>(self) as usize,
+            (self.desc.dimension == BUFFER).then(|| (self.data() as usize, self.desc.width)),
+        );
     }
 }
 

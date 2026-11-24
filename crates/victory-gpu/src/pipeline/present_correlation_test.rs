@@ -168,7 +168,7 @@ fn dxbc_with_osg1(name: &str, system_value: u32) -> Vec<u8> {
     out
 }
 
-fn make_graphics_srv_read_pso() -> This {
+fn make_graphics_srv_read_pso_tagged(vs_tag: &[u8], ps_tag: &[u8]) -> (This, String, String) {
     use victory_shader::{
         Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, emit,
         io, ir, native::StageIo, resource, structure,
@@ -290,21 +290,149 @@ fn make_graphics_srv_read_pso() -> This {
     let container = Container::parse(&ps_dxbc).unwrap();
     let host_shader = emit::emit(&container, &native, &p, &st, &io_raised, &res).unwrap();
 
-    let vs = shader("vertex", b"vs-srv-read-correlation-test");
+    let vs = shader("vertex", vs_tag);
+    let vs_hash = vs.hash.clone();
     vs.translated.get_or_init(|| {
         Some(Translated {
             host: vs_host,
             used: Vec::new(),
         })
     });
-    let ps = shader("pixel", b"ps-srv-read-correlation-test");
+    let ps = shader("pixel", ps_tag);
+    let ps_hash = ps.hash.clone();
     ps.translated.get_or_init(|| {
         Some(Translated {
             host: host_shader,
             used: native.used.clone(),
         })
     });
-    build_graphics_stream_pso(vs, ps, 1)
+    (build_graphics_stream_pso(vs, ps, 1), vs_hash, ps_hash)
+}
+
+fn make_graphics_srv_read_pso() -> This {
+    make_graphics_srv_read_pso_tagged(
+        b"vs-srv-read-correlation-test",
+        b"ps-srv-read-correlation-test",
+    )
+    .0
+}
+
+fn make_compute_uav_buffer_noop_pso() -> This {
+    use victory_shader::{
+        Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, emit,
+        io, ir,
+        native::{ComputeIo, StageIo},
+        resource, structure,
+    };
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    const S_WAITCNT_0: u32 = 0xBF8C_0000;
+    const ZERO: u32 = 0x80;
+    let s_mov = |d: u8, src: u32| 0xBE80_0300 | u32::from(d) << 16 | src;
+    let s_load_x4 = |d: u8, base: u8| -> [u32; 2] {
+        [
+            0xF408_0000 | u32::from(d) << 6 | u32::from(base / 2),
+            0xFA00_0000,
+        ]
+    };
+    let mut words = Vec::new();
+    words.push(s_mov(10, 0));
+    words.push(s_mov(11, ZERO));
+    words.extend(s_load_x4(12, 10));
+    words.push(S_WAITCNT_0);
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io_raised = io::raise(&p, &native).unwrap();
+    let mut dxbc_bytes = vec![0u8; 0x20];
+    dxbc_bytes[0..4].copy_from_slice(b"DXBC");
+    dxbc_bytes[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    dxbc_bytes[0x18..0x1c].copy_from_slice(&0x20u32.to_le_bytes());
+    let container = Container::parse(&dxbc_bytes).unwrap();
+    let host_shader = emit::emit(&container, &native, &p, &st, &io_raised, &res).unwrap();
+
+    let cs = shader("compute", b"cs-uav-buffer-subrange-test");
+    cs.translated.get_or_init(|| {
+        Some(Translated {
+            host: host_shader,
+            used: native.used.clone(),
+        })
+    });
+    let mut pso = std::ptr::null();
+    assert_eq!(hand_out(vec![cs], None, &PIPELINE_IIDS[0], &mut pso), S_OK);
+    assert!(
+        host_pipeline(pso).is_some(),
+        "host refused compute UAV buffer pipeline"
+    );
+    pso
+}
+
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl LogCapture {
+    fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (Self(lines.clone()), lines)
+    }
+}
+
+struct LineVisitor(String);
+
+impl tracing::field::Visit for LineVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        self.0.push_str(&format!("{}={value:?}", field.name()));
+    }
+}
+
+impl tracing::Subscriber for LogCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = LineVisitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 fn make_compute_uav_fill_pso(rgba: [f32; 4]) -> This {
@@ -583,10 +711,84 @@ fn offscreen_multipass_readback_and_last_writer_correlation() {
     let dropped_tex = make_tex(1, 1);
     let reset_tex = make_tex(1, 1);
     let reset_after_tex = make_tex(1, 1);
+    let indirect_tex = make_tex(1, 1);
 
-    // Descriptor heaps: RTV heap (kind=2, count=5) and shader-visible view heap (kind=0, flags=1, count=4).
+    #[repr(C)]
+    struct BufDesc {
+        dimension: u32,
+        alignment: u64,
+        width: u64,
+        height: u32,
+        depth_or_array: u16,
+        mips: u16,
+        format: u32,
+        sample_count: u32,
+        sample_quality: u32,
+        layout: u32,
+        flags: u32,
+    }
+    let ib_desc = BufDesc {
+        dimension: 1,
+        alignment: 0,
+        width: 256,
+        height: 1,
+        depth_or_array: 1,
+        mips: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 4,
+    };
+    let ib_props = [1u32, 0, 0, 1, 1];
+    let mut indirect_args_buf = null;
+    assert_eq!(
+        crate::resource::create_committed(
+            null,
+            ib_props.as_ptr().cast(),
+            0,
+            (&raw const ib_desc).cast(),
+            0,
+            null.cast(),
+            &iid(ID3D12Resource::IID),
+            &mut indirect_args_buf,
+        ),
+        S_OK
+    );
+    let (ib_ptr, _) = crate::resource::buffer_bytes(indirect_args_buf).unwrap();
+    // SAFETY: 256-byte zeroed buffer; writing 16-byte D3D12_DRAW_ARGUMENTS.
+    unsafe {
+        std::ptr::copy_nonoverlapping([3u32, 1, 0, 0].as_ptr().cast::<u8>(), ib_ptr, 16);
+    }
+    #[repr(C)]
+    struct SigDesc {
+        stride: u32,
+        count: u32,
+        arguments: *const [u32; 4],
+        nodes: u32,
+    }
+    let sig_arg = [0u32, 0, 0, 0]; // D3D12_INDIRECT_ARGUMENT_TYPE_DRAW
+    let sig_desc = SigDesc {
+        stride: 16,
+        count: 1,
+        arguments: &sig_arg,
+        nodes: 0,
+    };
+    let mut cmd_sig = null;
+    assert_eq!(
+        crate::signature::create(
+            null,
+            (&raw const sig_desc).cast(),
+            null,
+            &iid(ID3D12CommandSignature::IID),
+            &mut cmd_sig,
+        ),
+        S_OK
+    );
+
+    // Descriptor heaps: RTV heap (kind=2, count=6) and shader-visible view heap (kind=0, flags=1, count=4).
     let (mut rtv_heap, mut view_heap) = (null, null);
-    let rtv_heap_desc = [2u32, 5, 0, 1];
+    let rtv_heap_desc = [2u32, 6, 0, 1];
     let view_heap_desc = [0u32, 4, 1, 1];
     assert_eq!(
         crate::descriptor::create_heap(
@@ -614,6 +816,7 @@ fn offscreen_multipass_readback_and_last_writer_correlation() {
     crate::descriptor::create_rtv(null, dropped_tex, null.cast(), rtv_base + 256);
     crate::descriptor::create_rtv(null, reset_tex, null.cast(), rtv_base + 384);
     crate::descriptor::create_rtv(null, reset_after_tex, null.cast(), rtv_base + 512);
+    crate::descriptor::create_rtv(null, indirect_tex, null.cast(), rtv_base + 640);
     crate::descriptor::create_uav(null, uav_tex, null, null.cast(), view_base);
 
     let gfx_pso_rtv = make_graphics_pso([0.25, 0.5, 0.75, 1.0], 1);
@@ -635,6 +838,7 @@ fn offscreen_multipass_readback_and_last_writer_correlation() {
     type Close = extern "system" fn(This) -> i32;
     type Reset = extern "system" fn(This, This, This) -> i32;
     type Execute = extern "system" fn(This, u32, *const This);
+    type ExecuteIndirect = extern "system" fn(This, This, u32, This, u64, This, u64);
     type Release = extern "system" fn(This) -> u32;
 
     #[repr(C)]
@@ -711,6 +915,14 @@ fn offscreen_multipass_readback_and_last_writer_correlation() {
     slot::<SetPipeline>(list1, 0xc8)(list1, null);
     slot::<Draw>(list1, 0x60)(list1, 3, 1, 0, 0);
 
+    // Pass 6: ExecuteIndirect Draw into indirect_tex.
+    let indirect_rtv = rtv_base + 640;
+    slot::<ClearRtv>(list1, 0x1a0)(list1, indirect_rtv, &[0.0, 0.0, 0.0, 1.0], 0, null.cast());
+    slot::<Targets>(list1, 0x190)(list1, 1, &indirect_rtv, 0, null.cast());
+    slot::<SetPipeline>(list1, 0xc8)(list1, gfx_pso_rtv);
+    let indirect_slot = if crate::device::newer() { 0x1e8 } else { 0x1d8 };
+    slot::<ExecuteIndirect>(list1, indirect_slot)(list1, cmd_sig, 1, indirect_args_buf, 0, null, 0);
+
     // Negative 2: unsubmitted list2 cleared, closed, reset() without execute(),
     // then reused for `reset_after_tex` so pre-reset writes must not leak.
     let reset_rtv = rtv_base + 384;
@@ -748,6 +960,11 @@ fn offscreen_multipass_readback_and_last_writer_correlation() {
         &readback_rgba8(host, resolve_dst),
         [51, 153, 204, 255],
         "resolve_dst",
+    );
+    assert_rgba_approx(
+        &readback_rgba8(host, indirect_tex),
+        [64, 128, 191, 255],
+        "indirect_tex",
     );
 
     // Verify last_writer and writer_chain provenance.
@@ -793,6 +1010,9 @@ fn offscreen_multipass_readback_and_last_writer_correlation() {
     let after_writer =
         crate::capture::last_writer(reset_after_tex as usize).expect("reused list writer");
     assert_eq!(after_writer.kind, WriteKind::ClearRtv);
+    let indirect_writer =
+        crate::capture::last_writer(indirect_tex as usize).expect("indirect_tex writer");
+    assert_eq!(indirect_writer.kind, WriteKind::IndirectDraw);
 
     // SAFETY: plain query.
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
@@ -812,6 +1032,9 @@ fn offscreen_multipass_readback_and_last_writer_correlation() {
         dropped_tex,
         reset_tex,
         reset_after_tex,
+        indirect_tex,
+        indirect_args_buf,
+        cmd_sig,
         rtv_heap,
         view_heap,
         gfx_pso_rtv,
@@ -1143,6 +1366,9 @@ fn dropped_compute_translation_marks_bound_input_never_host_written_in_isolated_
     slot::<GraphicsTable>(list1, 0x120)(list1, 0, view_base);
     slot::<Draw>(list1, 0x60)(list1, 3, 1, 0, 0);
 
+    let (subscriber, captured_logs) = LogCapture::new();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     assert_eq!(slot::<Close>(list1, 0x48)(list1), S_OK);
     slot::<Execute>(queue, 0x50)(queue, 1, &list1);
     assert_eq!(slot::<Reset>(list1, 0x50)(list1, allocator, null), S_OK);
@@ -1184,6 +1410,20 @@ fn dropped_compute_translation_marks_bound_input_never_host_written_in_isolated_
         "expected 'dropped upstream dispatch', got: {}",
         report.inputs[0].status
     );
+    assert!(
+        !report.inputs[0]
+            .status
+            .contains(&format!("compute {bad_cs_hash} (compute {bad_cs_hash})")),
+        "drop_summary must not duplicate compute hash: {}",
+        report.inputs[0].status
+    );
+    assert!(
+        report.inputs[0]
+            .status
+            .contains("shader translation failed"),
+        "expected clean drop_summary reason, got: {}",
+        report.inputs[0].status
+    );
 
     crate::capture::correlate_present(
         frame,
@@ -1197,6 +1437,12 @@ fn dropped_compute_translation_marks_bound_input_never_host_written_in_isolated_
         }],
     );
     crate::capture::end_frame(frame);
+
+    let logs = captured_logs.lock().unwrap().join("\n");
+    assert!(
+        logs.contains("bound input provenance") && logs.contains(&bad_cs_hash),
+        "expected tracing log for bound input provenance, got:\n{logs}"
+    );
 
     // SAFETY: plain query.
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
@@ -1216,6 +1462,681 @@ fn dropped_compute_translation_marks_bound_input_never_host_written_in_isolated_
         list1,
         allocator,
         queue,
+    ] {
+        assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
+    }
+}
+
+#[test]
+fn buffer_subrange_uav_srv_placed_and_drop_invalidation_in_isolated_child() {
+    const CHILD: &str = "VICTORY_BUFFER_SUBRANGE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "pipeline::present_correlation_test::buffer_subrange_uav_srv_placed_and_drop_invalidation_in_isolated_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_PRESENT_SOURCE_TRACE", "1")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "child test failed:\n{text}");
+        assert!(text.contains("1 passed"), "child ran no test:\n{text}");
+        return;
+    }
+
+    let Some(host) = crate::host::host() else {
+        eprintln!("skipped buffer subrange test: no host D3D12 device");
+        return;
+    };
+
+    let null: This = std::ptr::null();
+    let iid = |g: GUID| guid(g.data1, g.data2, g.data3, g.data4);
+    let (mut queue, mut allocator, mut list1) = (null, null, null);
+    let queue_desc = [0u32; 4];
+    assert_eq!(
+        crate::queue::create(
+            null,
+            queue_desc.as_ptr().cast(),
+            &iid(ID3D12CommandQueue::IID),
+            &mut queue
+        ),
+        S_OK
+    );
+    assert_eq!(
+        crate::list::create_allocator(null, 0, &iid(ID3D12CommandAllocator::IID), &mut allocator),
+        S_OK
+    );
+    assert_eq!(
+        crate::list::create_list(
+            null,
+            0,
+            0,
+            allocator,
+            null,
+            &iid(ID3D12GraphicsCommandList::IID),
+            &mut list1
+        ),
+        S_OK
+    );
+
+    #[repr(C)]
+    struct ResourceDesc {
+        dimension: u32,
+        alignment: u64,
+        width: u64,
+        height: u32,
+        depth_or_array: u16,
+        mips: u16,
+        format: u32,
+        sample_count: u32,
+        sample_quality: u32,
+        layout: u32,
+        flags: u32,
+    }
+    let props = [1u32, 0, 0, 1, 1];
+    let tex_desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 64,
+        height: 64,
+        depth_or_array: 1,
+        mips: 1,
+        format: 28,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 1,
+    };
+    let buf_desc = ResourceDesc {
+        dimension: 1,
+        alignment: 0,
+        width: 4096,
+        height: 1,
+        depth_or_array: 1,
+        mips: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 4,
+    };
+    let make_res = |desc: &ResourceDesc| -> This {
+        let mut out = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                props.as_ptr().cast(),
+                0,
+                (desc as *const ResourceDesc).cast(),
+                0,
+                null.cast(),
+                &iid(ID3D12Resource::IID),
+                &mut out,
+            ),
+            S_OK
+        );
+        out
+    };
+
+    let out_hit = make_res(&tex_desc);
+    let out_miss = make_res(&tex_desc);
+    let out_placed = make_res(&tex_desc);
+    let out_uav_overlap = make_res(&tex_desc);
+    let out_uav_miss = make_res(&tex_desc);
+    let drop_tex = make_res(&tex_desc);
+
+    let src_buf = make_res(&buf_desc);
+    let big_buf = make_res(&buf_desc);
+    let big_buf2 = make_res(&buf_desc);
+
+    let big_addr = crate::resource::buffer_bytes(big_buf).unwrap().0 as usize;
+    let big2_addr = crate::resource::buffer_bytes(big_buf2).unwrap().0 as usize;
+
+    let (mut rtv_heap, mut view_heap) = (null, null);
+    let rtv_heap_desc = [2u32, 6, 0, 1];
+    let view_heap_desc = [0u32, 8, 1, 1];
+    assert_eq!(
+        crate::descriptor::create_heap(
+            null,
+            rtv_heap_desc.as_ptr().cast(),
+            &iid(ID3D12DescriptorHeap::IID),
+            &mut rtv_heap,
+        ),
+        S_OK
+    );
+    assert_eq!(
+        crate::descriptor::create_heap(
+            null,
+            view_heap_desc.as_ptr().cast(),
+            &iid(ID3D12DescriptorHeap::IID),
+            &mut view_heap,
+        ),
+        S_OK
+    );
+    let rtv_base = crate::descriptor::heap(rtv_heap).start;
+    let view_base = crate::descriptor::heap(view_heap).start;
+
+    for (i, tex) in [
+        out_hit,
+        out_miss,
+        out_placed,
+        out_uav_overlap,
+        out_uav_miss,
+        drop_tex,
+    ]
+    .iter()
+    .enumerate()
+    {
+        crate::descriptor::create_rtv(null, *tex, null.cast(), rtv_base + (i as u64) * 128);
+    }
+
+    let make_srv = |first: u64, count: u32| D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: first,
+                NumElements: count,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            },
+        },
+    };
+    let srv_256 = make_srv(16, 4); // [+256, +320)
+    let srv_1024 = make_srv(64, 4); // [+1024, +1088)
+    let srv_0_256 = make_srv(0, 16); // [+0, +256)
+    let srv_2048 = make_srv(128, 4); // [+2048, +2112)
+
+    crate::descriptor::create_srv(null, big_buf, (&raw const srv_256).cast(), view_base);
+    crate::descriptor::create_srv(null, big_buf, (&raw const srv_1024).cast(), view_base + 32);
+
+    // Placed buffer SRV at FirstElement=16 (+256B) on big_buf.
+    let mut placed_res_words = [0u32; 14];
+    placed_res_words[0] = 1; // BUFFER
+    placed_res_words[4] = 4096;
+    placed_res_words[12] = 1; // ROW_MAJOR
+    let mut placed_srv_words = [0u32; 16];
+    // SAFETY: D3D12_SHADER_RESOURCE_VIEW_DESC is 40 bytes (10 u32s).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&raw const srv_256).cast::<u32>(),
+            placed_srv_words.as_mut_ptr(),
+            10,
+        );
+    }
+    placed_srv_words[10] = big_addr as u32;
+    placed_srv_words[11] = (big_addr as u64 >> 32) as u32;
+    crate::descriptor::create_placed_srv(
+        null,
+        &placed_res_words,
+        &placed_srv_words,
+        view_base + 64,
+    );
+
+    // UAV at FirstElement=4, NumElements=4 -> [+64, +128) on big_buf2.
+    let uav_64 = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                FirstElement: 4,
+                NumElements: 4,
+                StructureByteStride: 0,
+                CounterOffsetInBytes: 0,
+                Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+            },
+        },
+    };
+    crate::descriptor::create_uav(
+        null,
+        big_buf2,
+        null,
+        (&raw const uav_64).cast(),
+        view_base + 96,
+    );
+    crate::descriptor::create_srv(
+        null,
+        big_buf2,
+        (&raw const srv_0_256).cast(),
+        view_base + 128,
+    );
+    crate::descriptor::create_srv(
+        null,
+        big_buf2,
+        (&raw const srv_2048).cast(),
+        view_base + 160,
+    );
+
+    let gfx_srv_pso = make_graphics_srv_read_pso();
+    let cs_uav_pso = make_compute_uav_buffer_noop_pso();
+
+    type ClearRtv = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+    type Targets = extern "system" fn(This, u32, *const u64, i32, *const u64);
+    type SetPipeline = extern "system" fn(This, This);
+    type Topology = extern "system" fn(This, u32);
+    type Viewports = extern "system" fn(This, u32, *const D3D12_VIEWPORT);
+    type Scissors = extern "system" fn(This, u32, *const RECT);
+    type Draw = extern "system" fn(This, u32, u32, u32, u32);
+    type SetHeaps = extern "system" fn(This, u32, *const This);
+    type ComputeTable = extern "system" fn(This, u32, u64);
+    type GraphicsTable = extern "system" fn(This, u32, u64);
+    type Dispatch = extern "system" fn(This, u32, u32, u32);
+    type CopyBuf = extern "system" fn(This, This, u64, This, u64, u64);
+    type Close = extern "system" fn(This) -> i32;
+    type Reset = extern "system" fn(This, This, This) -> i32;
+    type Execute = extern "system" fn(This, u32, *const This);
+    type Release = extern "system" fn(This) -> u32;
+
+    let vp = D3D12_VIEWPORT {
+        Width: 64.0,
+        Height: 64.0,
+        MaxDepth: 1.0,
+        ..Default::default()
+    };
+    let sc = RECT {
+        left: 0,
+        top: 0,
+        right: 64,
+        bottom: 64,
+    };
+
+    // Write +256B into big_buf, then draw reading +256B, +1024B, and Placed +256B.
+    slot::<CopyBuf>(list1, 0x78)(list1, big_buf, 256, src_buf, 0, 64);
+    slot::<SetHeaps>(list1, 0x100)(list1, 1, &view_heap);
+    slot::<Topology>(list1, 0xa0)(list1, 4);
+    slot::<Viewports>(list1, 0xa8)(list1, 1, &vp);
+    slot::<Scissors>(list1, 0xb0)(list1, 1, &sc);
+    slot::<SetPipeline>(list1, 0xc8)(list1, gfx_srv_pso);
+
+    let draw_with_slot = |rtv_idx: u64, view_slot: u64| {
+        let rtv = rtv_base + rtv_idx * 128;
+        slot::<ClearRtv>(list1, 0x1a0)(list1, rtv, &[0.0, 0.0, 0.0, 1.0], 0, null.cast());
+        slot::<Targets>(list1, 0x190)(list1, 1, &rtv, 0, null.cast());
+        slot::<GraphicsTable>(list1, 0x120)(list1, 0, view_base + view_slot * 32);
+        slot::<Draw>(list1, 0x60)(list1, 3, 1, 0, 0);
+    };
+    draw_with_slot(0, 0); // out_hit <- big_buf + 256
+    draw_with_slot(1, 1); // out_miss <- big_buf + 1024 (unwritten)
+    draw_with_slot(2, 2); // out_placed <- placed big_buf + 256
+
+    // Dispatch UAV write to big_buf2 [+64, +128), then draw reading [+0, +256) and [+2048, +2112).
+    slot::<SetPipeline>(list1, 0xc8)(list1, cs_uav_pso);
+    slot::<ComputeTable>(list1, 0x118)(list1, 0, view_base + 96);
+    slot::<Dispatch>(list1, 0x70)(list1, 1, 1, 1);
+    slot::<SetPipeline>(list1, 0xc8)(list1, gfx_srv_pso);
+    draw_with_slot(3, 4); // out_uav_overlap <- big_buf2 [+0, +256)
+    draw_with_slot(4, 5); // out_uav_miss <- big_buf2 [+2048, +2112)
+
+    // Clear drop_tex so it records a writer before being released.
+    slot::<ClearRtv>(list1, 0x1a0)(
+        list1,
+        rtv_base + 5 * 128,
+        &[0.1, 0.2, 0.3, 1.0],
+        0,
+        null.cast(),
+    );
+
+    let (subscriber, captured_logs) = LogCapture::new();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    assert_eq!(slot::<Close>(list1, 0x48)(list1), S_OK);
+    slot::<Execute>(queue, 0x50)(queue, 1, &list1);
+    assert_eq!(slot::<Reset>(list1, 0x50)(list1, allocator, null), S_OK);
+
+    let frame = crate::queue::presented() + 1;
+    let reports = crate::capture::input_reports(frame);
+    let report_for = |rtv: This| {
+        reports
+            .iter()
+            .find(|r| r.targets.contains(&(rtv as usize)))
+            .expect("missing input report")
+    };
+
+    let r_hit = report_for(out_hit);
+    assert_eq!(r_hit.inputs[0].input.resource, big_addr + 256);
+    assert_eq!(
+        r_hit.inputs[0].writer.as_ref().map(|w| w.kind),
+        Some(WriteKind::CopyBufferRegion)
+    );
+
+    let r_miss = report_for(out_miss);
+    assert_eq!(r_miss.inputs[0].input.resource, big_addr + 1024);
+    assert!(r_miss.inputs[0].writer.is_none());
+    assert!(r_miss.inputs[0].status.contains("never host-written"));
+
+    let r_placed = report_for(out_placed);
+    assert_eq!(r_placed.inputs[0].input.resource, big_addr + 256);
+    assert_eq!(
+        r_placed.inputs[0].writer.as_ref().map(|w| w.kind),
+        Some(WriteKind::CopyBufferRegion)
+    );
+
+    let r_uav_hit = report_for(out_uav_overlap);
+    assert_eq!(r_uav_hit.inputs[0].input.resource, big2_addr);
+    assert_eq!(r_uav_hit.inputs[0].input.size, 256);
+    assert_eq!(
+        r_uav_hit.inputs[0].writer.as_ref().map(|w| w.kind),
+        Some(WriteKind::Dispatch)
+    );
+    assert_eq!(
+        r_uav_hit.inputs[0].writer.as_ref().map(|w| w.target),
+        Some(big2_addr + 64)
+    );
+
+    let r_uav_miss = report_for(out_uav_miss);
+    assert_eq!(r_uav_miss.inputs[0].input.resource, big2_addr + 2048);
+    assert!(r_uav_miss.inputs[0].writer.is_none());
+
+    // Release drop_tex and big_buf; Resource::drop must purge both LAST_WRITERS and frame writes.
+    assert!(crate::capture::last_writer(drop_tex as usize).is_some());
+    assert!(crate::capture::last_writer(big_addr + 256).is_some());
+    assert_eq!(slot::<Release>(drop_tex, 0x10)(drop_tex), 0);
+    assert_eq!(slot::<Release>(big_buf, 0x10)(big_buf), 0);
+    assert!(
+        crate::capture::last_writer(drop_tex as usize).is_none(),
+        "Resource::drop must invalidate texture LAST_WRITERS"
+    );
+    assert!(
+        crate::capture::last_writer(big_addr + 256).is_none(),
+        "Resource::drop must invalidate buffer subrange LAST_WRITERS"
+    );
+
+    crate::capture::end_frame(frame);
+    let logs = captured_logs.lock().unwrap().join("\n");
+    assert!(logs.contains("bound input provenance"));
+
+    // SAFETY: plain query.
+    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    assert_eq!(
+        host.log_messages(),
+        None,
+        "D3D12 debug layer reported an error"
+    );
+
+    for obj in [
+        out_hit,
+        out_miss,
+        out_placed,
+        out_uav_overlap,
+        out_uav_miss,
+        src_buf,
+        big_buf2,
+        rtv_heap,
+        view_heap,
+        gfx_srv_pso,
+        cs_uav_pso,
+        list1,
+        allocator,
+        queue,
+    ] {
+        assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
+    }
+}
+
+#[test]
+fn trace_input_env_filters_pso_0x_and_vs_stage_only_in_isolated_child() {
+    const CHILD: &str = "VICTORY_TRACE_FILTER_CHILD";
+    let vs_a_tag = b"filter-vs-a-tag";
+    let ps_a_tag = b"filter-ps-a-tag";
+    let vs_b_tag = b"filter-vs-b-tag";
+    let ps_b_tag = b"filter-ps-b-tag";
+    let vs_c_tag = b"filter-vs-c-tag";
+    let ps_c_tag = b"filter-ps-c-tag";
+
+    let ps_a_hash = blake3::hash(ps_a_tag).to_hex()[..16].to_owned();
+    let vs_b_hash = blake3::hash(vs_b_tag).to_hex()[..16].to_owned();
+    let ps_c_hash = blake3::hash(ps_c_tag).to_hex()[..16].to_owned();
+
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "pipeline::present_correlation_test::trace_input_env_filters_pso_0x_and_vs_stage_only_in_isolated_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_PRESENT_SOURCE_TRACE", "1")
+            .env("VICTORY_TRACE_INPUTS_PSO", format!("0x{ps_a_hash}"))
+            .env("VICTORY_TRACE_INPUTS_VS", format!("0X{vs_b_hash},{ps_c_hash}"))
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "child test failed:\n{text}");
+        assert!(text.contains("1 passed"), "child ran no test:\n{text}");
+        return;
+    }
+
+    let Some(host) = crate::host::host() else {
+        eprintln!("skipped filter test: no host D3D12 device");
+        return;
+    };
+
+    let null: This = std::ptr::null();
+    let iid = |g: GUID| guid(g.data1, g.data2, g.data3, g.data4);
+    let (mut queue, mut allocator, mut list1) = (null, null, null);
+    let queue_desc = [0u32; 4];
+    assert_eq!(
+        crate::queue::create(
+            null,
+            queue_desc.as_ptr().cast(),
+            &iid(ID3D12CommandQueue::IID),
+            &mut queue
+        ),
+        S_OK
+    );
+    assert_eq!(
+        crate::list::create_allocator(null, 0, &iid(ID3D12CommandAllocator::IID), &mut allocator),
+        S_OK
+    );
+    assert_eq!(
+        crate::list::create_list(
+            null,
+            0,
+            0,
+            allocator,
+            null,
+            &iid(ID3D12GraphicsCommandList::IID),
+            &mut list1
+        ),
+        S_OK
+    );
+
+    #[repr(C)]
+    struct ResourceDesc {
+        dimension: u32,
+        alignment: u64,
+        width: u64,
+        height: u32,
+        depth_or_array: u16,
+        mips: u16,
+        format: u32,
+        sample_count: u32,
+        sample_quality: u32,
+        layout: u32,
+        flags: u32,
+    }
+    let props = [1u32, 0, 0, 1, 1];
+    let tex_desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 64,
+        height: 64,
+        depth_or_array: 1,
+        mips: 1,
+        format: 28,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 1,
+    };
+    let buf_desc = ResourceDesc {
+        dimension: 1,
+        alignment: 0,
+        width: 256,
+        height: 1,
+        depth_or_array: 1,
+        mips: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 4,
+    };
+    let (mut tex_a, mut tex_b, mut tex_c, mut buf) = (null, null, null, null);
+    for (desc, out) in [
+        (&tex_desc, &mut tex_a),
+        (&tex_desc, &mut tex_b),
+        (&tex_desc, &mut tex_c),
+        (&buf_desc, &mut buf),
+    ] {
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                props.as_ptr().cast(),
+                0,
+                (desc as *const ResourceDesc).cast(),
+                0,
+                null.cast(),
+                &iid(ID3D12Resource::IID),
+                out,
+            ),
+            S_OK
+        );
+    }
+
+    let (mut rtv_heap, mut view_heap) = (null, null);
+    let rtv_heap_desc = [2u32, 3, 0, 1];
+    let view_heap_desc = [0u32, 1, 1, 1];
+    assert_eq!(
+        crate::descriptor::create_heap(
+            null,
+            rtv_heap_desc.as_ptr().cast(),
+            &iid(ID3D12DescriptorHeap::IID),
+            &mut rtv_heap,
+        ),
+        S_OK
+    );
+    assert_eq!(
+        crate::descriptor::create_heap(
+            null,
+            view_heap_desc.as_ptr().cast(),
+            &iid(ID3D12DescriptorHeap::IID),
+            &mut view_heap,
+        ),
+        S_OK
+    );
+    let rtv_base = crate::descriptor::heap(rtv_heap).start;
+    let view_base = crate::descriptor::heap(view_heap).start;
+    for (i, tex) in [tex_a, tex_b, tex_c].iter().enumerate() {
+        crate::descriptor::create_rtv(null, *tex, null.cast(), rtv_base + (i as u64) * 128);
+    }
+    let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: 4,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            },
+        },
+    };
+    crate::descriptor::create_srv(null, buf, (&raw const srv_desc).cast(), view_base);
+
+    let (pso_a, _, _) = make_graphics_srv_read_pso_tagged(vs_a_tag, ps_a_tag);
+    let (pso_b, _, _) = make_graphics_srv_read_pso_tagged(vs_b_tag, ps_b_tag);
+    let (pso_c, _, _) = make_graphics_srv_read_pso_tagged(vs_c_tag, ps_c_tag);
+
+    type ClearRtv = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+    type Targets = extern "system" fn(This, u32, *const u64, i32, *const u64);
+    type SetPipeline = extern "system" fn(This, This);
+    type Topology = extern "system" fn(This, u32);
+    type Viewports = extern "system" fn(This, u32, *const D3D12_VIEWPORT);
+    type Scissors = extern "system" fn(This, u32, *const RECT);
+    type Draw = extern "system" fn(This, u32, u32, u32, u32);
+    type SetHeaps = extern "system" fn(This, u32, *const This);
+    type GraphicsTable = extern "system" fn(This, u32, u64);
+    type Close = extern "system" fn(This) -> i32;
+    type Reset = extern "system" fn(This, This, This) -> i32;
+    type Execute = extern "system" fn(This, u32, *const This);
+    type Release = extern "system" fn(This) -> u32;
+
+    let vp = D3D12_VIEWPORT {
+        Width: 64.0,
+        Height: 64.0,
+        MaxDepth: 1.0,
+        ..Default::default()
+    };
+    let sc = RECT {
+        left: 0,
+        top: 0,
+        right: 64,
+        bottom: 64,
+    };
+
+    slot::<SetHeaps>(list1, 0x100)(list1, 1, &view_heap);
+    slot::<Topology>(list1, 0xa0)(list1, 4);
+    slot::<Viewports>(list1, 0xa8)(list1, 1, &vp);
+    slot::<Scissors>(list1, 0xb0)(list1, 1, &sc);
+    for (i, pso) in [pso_a, pso_b, pso_c].iter().enumerate() {
+        let rtv = rtv_base + (i as u64) * 128;
+        slot::<ClearRtv>(list1, 0x1a0)(list1, rtv, &[0.0, 0.0, 0.0, 1.0], 0, null.cast());
+        slot::<Targets>(list1, 0x190)(list1, 1, &rtv, 0, null.cast());
+        slot::<SetPipeline>(list1, 0xc8)(list1, *pso);
+        slot::<GraphicsTable>(list1, 0x120)(list1, 0, view_base);
+        slot::<Draw>(list1, 0x60)(list1, 3, 1, 0, 0);
+    }
+
+    assert_eq!(slot::<Close>(list1, 0x48)(list1), S_OK);
+    slot::<Execute>(queue, 0x50)(queue, 1, &list1);
+    assert_eq!(slot::<Reset>(list1, 0x50)(list1, allocator, null), S_OK);
+
+    let frame = crate::queue::presented() + 1;
+    let reports = crate::capture::input_reports(frame);
+    assert!(
+        reports
+            .iter()
+            .any(|r| r.targets.contains(&(tex_a as usize))),
+        "VICTORY_TRACE_INPUTS_PSO=0x... must match pso_a"
+    );
+    assert!(
+        reports
+            .iter()
+            .any(|r| r.targets.contains(&(tex_b as usize))),
+        "VICTORY_TRACE_INPUTS_VS=0X... must match pso_b vertex shader"
+    );
+    assert!(
+        !reports
+            .iter()
+            .any(|r| r.targets.contains(&(tex_c as usize))),
+        "VICTORY_TRACE_INPUTS_VS must NOT match pso_c pixel shader even with VICTORY_PRESENT_SOURCE_TRACE=1"
+    );
+    crate::capture::end_frame(frame);
+
+    // SAFETY: plain query.
+    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    assert_eq!(
+        host.log_messages(),
+        None,
+        "D3D12 debug layer reported an error"
+    );
+
+    for obj in [
+        tex_a, tex_b, tex_c, buf, rtv_heap, view_heap, pso_a, pso_b, pso_c, list1, allocator, queue,
     ] {
         assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
     }

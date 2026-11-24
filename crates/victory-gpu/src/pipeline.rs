@@ -291,7 +291,15 @@ pub(crate) fn drop_summary(this: This) -> (String, String) {
         .join(" + ");
     let reason = skipped_shader(p)
         .map(|hash| format!("skipped shader {hash}"))
-        .or_else(|| make::missing(&p.host))
+        .or_else(|| {
+            make::missing(&p.host).map(|missing| {
+                if missing == id {
+                    "shader translation failed".to_owned()
+                } else {
+                    missing
+                }
+            })
+        })
         .unwrap_or_else(|| "missing host pipeline".to_owned());
     (id, reason)
 }

@@ -1258,13 +1258,16 @@ impl State {
                         } else if let Some((data, len)) =
                             crate::resource::buffer_bytes(*resource as This)
                         {
+                            let (target, width) = crate::descriptor::host::buffer_range(&raw_view)
+                                .filter(|&(_, sub_len)| sub_len > 0)
+                                .unwrap_or((data as u64, len));
                             list.record_write(crate::capture::WriteRecord {
-                                target: data as usize,
+                                target: target as usize,
                                 source: None,
                                 kind,
                                 slot: Some(u.lower_bound),
                                 subresource: 0,
-                                width: len,
+                                width,
                                 height: 1,
                                 format: 0,
                                 pipeline: p.name.clone(),
@@ -1278,14 +1281,17 @@ impl State {
                     View::Placed(true, resource, desc) if resource[0] == 1 => {
                         let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
                         let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                        if crate::shadow::find(address, len).is_some() {
+                        let (target, width) = crate::descriptor::host::buffer_range(&raw_view)
+                            .filter(|&(_, sub_len)| sub_len > 0)
+                            .unwrap_or((address, len));
+                        if crate::shadow::find(target, width).is_some() {
                             list.record_write(crate::capture::WriteRecord {
-                                target: address as usize,
+                                target: target as usize,
                                 source: None,
                                 kind,
                                 slot: Some(u.lower_bound),
                                 subresource: 0,
-                                width: len,
+                                width,
                                 height: 1,
                                 format: 0,
                                 pipeline: p.name.clone(),
@@ -1311,8 +1317,13 @@ impl State {
         op_index: u32,
         initial_targets: &[usize],
     ) {
-        let stage_hashes: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
-        if !crate::capture::should_trace_inputs(&p.name, &stage_hashes) {
+        let vs_hashes: Vec<&str> = p
+            .stages
+            .iter()
+            .filter(|s| s.shader.stage == "vertex")
+            .map(|s| s.shader.hash.as_str())
+            .collect();
+        if !crate::capture::should_trace_inputs(&p.name, &vs_hashes) {
             return;
         }
         let mut inputs = Vec::new();
@@ -1339,14 +1350,26 @@ impl State {
                             Some((crate::capture::InputKind::Srv, *res, false, 0))
                         } else {
                             crate::resource::buffer_bytes(*res as This).map(|(data, len)| {
-                                (crate::capture::InputKind::Srv, data as usize, true, len)
+                                let (addr, sub_len) =
+                                    crate::descriptor::host::buffer_range(&raw_view)
+                                        .filter(|&(_, l)| l > 0)
+                                        .unwrap_or((data as u64, len));
+                                (crate::capture::InputKind::Srv, addr as usize, true, sub_len)
                             })
                         }
                     }
                     (ResourceType::Srv, View::Placed(false, res, desc)) if res[0] == 1 => {
                         let len = u64::from(res[4]) | u64::from(res[5]) << 32;
                         let addr = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                        Some((crate::capture::InputKind::Srv, addr as usize, true, len))
+                        let (sub_addr, sub_len) = crate::descriptor::host::buffer_range(&raw_view)
+                            .filter(|&(_, l)| l > 0)
+                            .unwrap_or((addr, len));
+                        Some((
+                            crate::capture::InputKind::Srv,
+                            sub_addr as usize,
+                            true,
+                            sub_len,
+                        ))
                     }
                     (ResourceType::Cbv, View::Constant(addr, size)) => Some((
                         crate::capture::InputKind::Cbv,
@@ -1362,20 +1385,32 @@ impl State {
                             Some((crate::capture::InputKind::Uav, *res, false, 0))
                         } else {
                             crate::resource::buffer_bytes(*res as This).map(|(data, len)| {
-                                if !targets.contains(&(data as usize)) {
-                                    targets.push(data as usize);
+                                let (addr, sub_len) =
+                                    crate::descriptor::host::buffer_range(&raw_view)
+                                        .filter(|&(_, l)| l > 0)
+                                        .unwrap_or((data as u64, len));
+                                if !targets.contains(&(addr as usize)) {
+                                    targets.push(addr as usize);
                                 }
-                                (crate::capture::InputKind::Uav, data as usize, true, len)
+                                (crate::capture::InputKind::Uav, addr as usize, true, sub_len)
                             })
                         }
                     }
                     (ResourceType::Uav, View::Placed(true, res, desc)) if res[0] == 1 => {
                         let len = u64::from(res[4]) | u64::from(res[5]) << 32;
                         let addr = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                        if !targets.contains(&(addr as usize)) {
-                            targets.push(addr as usize);
+                        let (sub_addr, sub_len) = crate::descriptor::host::buffer_range(&raw_view)
+                            .filter(|&(_, l)| l > 0)
+                            .unwrap_or((addr, len));
+                        if !targets.contains(&(sub_addr as usize)) {
+                            targets.push(sub_addr as usize);
                         }
-                        Some((crate::capture::InputKind::Uav, addr as usize, true, len))
+                        Some((
+                            crate::capture::InputKind::Uav,
+                            sub_addr as usize,
+                            true,
+                            sub_len,
+                        ))
                     }
                     _ => None,
                 };
