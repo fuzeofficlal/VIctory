@@ -2943,7 +2943,9 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
+        // How the program uses the descriptor (directly or through another
+        // load of the same heap entry) tells the view's kind; without a use,
+        // the table's used-resource range does.
         let use_at = self
             .x
             .res
@@ -2952,50 +2954,98 @@ impl<'a> Lower<'a> {
             .filter(|d| d.role == Role::Resource)
             .find_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                    Source::Loaded { load, first } if load == site => Some((d.site, first, 0u32)),
                     _ => None,
                 })
-            });
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+            })
+            .or_else(|| self.same_entry_use(site, count));
+        let (src, first, in_slot, uav, props, image) = match use_at {
+            Some((at, first, in_slot)) => {
+                let src = Source::Loaded { load: site, first };
+                let used = self.used_kind(&src);
+                let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+                let un = ui.name();
+                let uav = un.contains("store")
+                    || un.contains("atomic")
+                    || used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match &ui.fields {
+                    Fields::Image { dim, .. } => {
+                        let kind = match dim {
+                            0 => 1,
+                            1 => 2,
+                            2 => 4,
+                            4 => 6,
+                            5 => 7,
+                            _ => return Err("an image dimension (cube or MSAA)"),
+                        };
+                        ((kind | u, 0x409), Some(kind))
+                    }
+                    Fields::Buffer { idxen, format, .. } => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format")
+                        {
+                            (10 | u, 0x409)
+                        } else if *idxen
+                            && format.is_none()
+                            && stride >= 4
+                            && stride.is_multiple_of(4)
+                        {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        (props, None)
+                    }
+                    Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
+                        // `smem` declares a raw SRV only when `used` says SRV;
+                        // otherwise it declares a constant buffer.
+                        if !used.is_some_and(|u| u.kind == ResourceType::Srv) {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        ((11, 0), None)
+                    }
+                    _ => return Err("a scalar memory read as data"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                let is_sbuf = un.starts_with("s_buffer_load");
+                (src, first, in_slot, uav && !is_sbuf, props, image)
             }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
+            None => {
+                const NONE: Why = "a descriptor read only as data";
+                let a = *self.scalar.get(&site).ok_or(NONE)?;
+                let src = Source::Loaded {
+                    load: site,
+                    first: 0,
                 };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                let used = self.used_kind(&src).ok_or(NONE)?;
+                if used.kind == ResourceType::Cbv {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                (props, None)
+                if !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+                    return Err(NONE);
+                }
+                let in_slot = (a.offset % 32) / 4;
+                if !a.offset.is_multiple_of(4) || in_slot + count > u32::from(used.dwords) {
+                    return Err(NONE);
+                }
+                let uav = used.kind == ResourceType::Uav;
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match used.dwords {
+                    // shortcut: without an image access to name the dimension,
+                    // an eight-dword view is taken as 2D.
+                    8 => ((2 | u, 0x409), Some(2)),
+                    4 if used.stride >= 4 && used.stride.is_multiple_of(4) => {
+                        ((12 | u, used.stride), None)
+                    }
+                    4 if used.stride == 0 => ((11 | u, 0), None),
+                    _ => return Err(NONE),
+                };
+                (src, 0, in_slot, uav, props, image)
             }
-            _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -3050,7 +3100,7 @@ impl<'a> Lower<'a> {
             None => vec![(2, field(self, 0))],
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
+            let rel = (in_slot + k).wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
@@ -3061,6 +3111,57 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Another load of the 32-byte heap entry that `site` reads, used as a
+    /// resource: its use site, `site`'s starting dword, and `site`'s dword
+    /// offset within the entry.
+    fn same_entry_use(&self, site: Site, count: u32) -> Option<(Site, u8, u32)> {
+        let a = *self.scalar.get(&site)?;
+        if a.param == CODE || !a.offset.is_multiple_of(4) {
+            return None;
+        }
+        let slot_byte = a.offset & !31;
+        let in_slot = (a.offset - slot_byte) / 4;
+        if in_slot + count > 8 {
+            return None;
+        }
+        let lane = |v: Value| -> Value {
+            self.x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+                .filter(|i| i.name() == "v_readfirstlane_b32")
+                .and_then(|i| i.reads.iter().find(|r| matches!(r.0, Reg::V(_))))
+                .map_or(v, |r| r.1)
+        };
+        let same_entry = |b: &Address, other_first: u8| {
+            b.param == a.param
+                && b.offset.wrapping_add(4 * u32::from(other_first)) == slot_byte
+                && match (a.dynamic, b.dynamic) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => x == y || lane(x) == lane(y),
+                    _ => false,
+                }
+        };
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+            .find_map(|d| {
+                d.source.leaves().into_iter().find_map(|l| match *l {
+                    Source::Loaded { load, first }
+                        if load != site
+                            && self.scalar.get(&load).is_some_and(|b| same_entry(b, first)) =>
+                    {
+                        Some((d.site, 0, in_slot))
+                    }
+                    _ => None,
+                })
+            })
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -7099,9 +7200,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7217,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7239,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -7417,5 +7518,454 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    fn s_load(op: u8, sdst: u8, sbase: u8, byte_off: u32) -> [u32; 2] {
+        [
+            0x3D << 26 | (u32::from(op) << 18) | (u32::from(sdst) << 6) | (u32::from(sbase) >> 1),
+            0xFA00_0000 | (byte_off & 0x1F_FFFF),
+        ]
+    }
+
+    fn v_mov_sgpr(vdst: u8, ssrc: u8) -> u32 {
+        0x7E00_0200 | (u32::from(vdst) << 17) | u32::from(ssrc)
+    }
+
+    fn v_alignbit_30(vdst: u8, src0_sgpr: u8, src1_sgpr: u8) -> [u32; 2] {
+        [
+            0xD54E_0000 | u32::from(vdst),
+            ((128 + 30) << 18) | (u32::from(src1_sgpr) << 9) | u32::from(src0_sgpr),
+        ]
+    }
+
+    fn buf_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+        [
+            0x38 << 26 | 0x1C << 18 | u32::from(byte_off & 0xFFF),
+            0x80 << 24 | ((u32::from(srsrc) >> 2) << 16) | (u32::from(vdata) << 8),
+        ]
+    }
+
+    fn compile_cs_for_host(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<super::super::HostShader, crate::ShaderError> {
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 64,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: sgprs.max(2) << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 64)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })?;
+        let shader = super::super::HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+        };
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        Ok(shader)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn descriptor_size_queries_without_access_sites_read_back_on_gpu() {
+        use super::super::host::{Dispatch, Host, Root, Stride, View};
+
+        // Pure size-query compute shader with zero sampling or buffer-read
+        // instructions on entries 0..3 and 5:
+        //   slot 0 (0x00, 8 dwords, SRV): 12x6 2D texture -> (w-1)|(h-1)<<16, dword 3
+        //   slot 1 (0x20, 4 dwords, SRV, stride=16): 80-byte structured buffer -> 5 records
+        //   slot 2 (0x40, 4 dwords, SRV, stride=0):  56-byte raw buffer -> 56 bytes
+        //   slot 3 (0x60, 8 dwords, UAV): 10x7 RWTexture2D -> (w-1)|(h-1)<<16
+        //   slot 4 (0x80, 4 dwords, UAV): output RawUav(6)
+        //   slot 5 (0xA0, 4 dwords, UAV): RawUav(9) (36 bytes), narrowed 1-dword load at +0x08
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+        ];
+        words.extend(s_load(0x03, 8, 4, 0x00)); // s[8:15]  = slot 0 (8-dword SRV image)
+        words.extend(s_load(0x02, 16, 4, 0x20)); // s[16:19] = slot 1 (structured SRV)
+        words.extend(s_load(0x02, 20, 4, 0x40)); // s[20:23] = slot 2 (raw SRV)
+        words.extend(s_load(0x03, 24, 4, 0x60)); // s[24:31] = slot 3 (8-dword UAV image)
+        words.extend(s_load(0x02, 32, 4, 0x80)); // s[32:35] = slot 4 (output UAV)
+        words.extend(s_load(0x00, 36, 4, 0xA8)); // s36      = slot 5 dword 2 (narrowed +8)
+
+        words.extend(v_alignbit_30(1, 10, 9)); // v1 = (12 - 1) | ((6 - 1) << 16)
+        words.push(v_mov_sgpr(2, 11)); // v2 = image dword 3 (type=2D, last_level=0)
+        words.push(v_mov_sgpr(3, 18)); // v3 = structured record count (5)
+        words.push(v_mov_sgpr(4, 22)); // v4 = raw byte size (56)
+        words.extend(v_alignbit_30(5, 26, 25)); // v5 = UAV (10 - 1) | ((7 - 1) << 16)
+        words.push(v_mov_sgpr(6, 36)); // v6 = narrowed UAV byte size (36)
+        for k in 0..6u8 {
+            words.extend(buf_store_dword(1 + k, 32, 4 * u16::from(k)));
+        }
+        words.push(S_ENDPGM);
+
+        let entry = |kind, table_offset_dwords, dwords, stride| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        };
+        let shader = compile_cs_for_host(
+            &words,
+            vec![root(RootType::Table, 0, 0)],
+            vec![
+                entry(ResourceType::Srv, 0, 8, 0),
+                entry(ResourceType::Srv, 8, 4, 16),
+                entry(ResourceType::Srv, 16, 4, 0),
+                entry(ResourceType::Uav, 24, 8, 0),
+                entry(ResourceType::Uav, 32, 4, 0),
+                entry(ResourceType::Uav, 40, 4, 0),
+            ],
+        )
+        .unwrap();
+
+        let texels = [[0.0f32; 4]; 12 * 6];
+        let structured_words = [0u32; 20]; // 80 bytes = 5 elements of 16 bytes
+        let raw_words = [0u32; 14]; // 56 bytes
+        let views = [
+            View::Texture(12, 6, &texels),
+            View::Buffer {
+                data: &structured_words,
+                stride: Stride::Structured(16),
+            },
+            View::Buffer {
+                data: &raw_words,
+                stride: Stride::Raw,
+            },
+            View::TextureUav(10, 7),
+            View::RawUav(6),
+            View::RawUav(9),
+        ];
+
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            ran += 1;
+            let (rs, pso) = host.compute_pipeline(&shader).unwrap();
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &rs,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            // `out` holds readbacks of UAVs in heap order: slot 3 (TextureUav),
+            // slot 4 (our 6-dword RawUav), slot 5 (RawUav(9)).
+            assert_eq!(
+                out[1],
+                vec![11 | (5 << 16), 0x9000_0FAC, 5, 56, 9 | (6 << 16), 36,],
+                "{label}"
+            );
+        }
+        assert!(ran > 0, "expected at least one D3D12 device");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn s_buffer_load_and_size_query_read_back_on_gpu() {
+        use super::super::host::{Dispatch, Host, Root, Stride, View};
+
+        // Descriptor at slot 0 is read via `s_buffer_load_dword` (Fields::Smem)
+        // AND its dword 2 (`NUM_RECORDS`) is read as a scalar number.
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+        ];
+        words.extend(s_load(0x02, 8, 4, 0x00)); // s[8:11]  = raw buffer SRV
+        words.extend(s_load(0x02, 12, 4, 0x20)); // s[12:15] = output RawUav(2)
+        words.extend([0xF420_0404, 0xFA00_0008]); // s_buffer_load_dword s16, s[8:11], 0x8
+        words.push(v_mov_sgpr(1, 16)); // v1 = loaded dword[2] (77)
+        words.push(v_mov_sgpr(2, 10)); // v2 = NUM_RECORDS in bytes (48)
+        words.extend(buf_store_dword(1, 12, 0));
+        words.extend(buf_store_dword(2, 12, 4));
+        words.push(S_ENDPGM);
+
+        let entry = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let shader = compile_cs_for_host(
+            &words,
+            vec![root(RootType::Table, 0, 0)],
+            vec![entry(ResourceType::Srv, 0), entry(ResourceType::Uav, 8)],
+        )
+        .unwrap();
+
+        let data = [11u32, 22, 77, 44, 55, 66, 88, 99, 1, 2, 3, 4]; // 12 dwords = 48 bytes
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+            View::RawUav(2),
+        ];
+
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            ran += 1;
+            let (rs, pso) = host.compute_pipeline(&shader).unwrap();
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &rs,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0], vec![77, 48], "{label}");
+        }
+        assert!(ran > 0);
+    }
+
+    #[test]
+    fn descriptor_data_refuses_cbv_untracked_unaligned_and_resolves_twin_loads() {
+        let refusal = |res: Result<super::super::HostShader, crate::ShaderError>| match res {
+            Ok(_) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(other) => panic!("unexpected error: {other}"),
+        };
+        let single_read = |load_op: u8, off: u32, read_sgpr: u8| {
+            let mut w = vec![0xBE84_0300, 0xBE85_0380];
+            w.extend(s_load(load_op, 8, 4, off));
+            w.extend(s_load(0x02, 20, 4, 0x40));
+            w.push(v_mov_sgpr(1, read_sgpr));
+            w.extend(buf_store_dword(1, 20, 0));
+            w.push(S_ENDPGM);
+            w
+        };
+        let uav_out = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 16,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+
+        // 1. CBV descriptor read only as data stays refused.
+        let cbv = UsedResource {
+            kind: ResourceType::Cbv,
+            dwords: 4,
+            table_offset_dwords: 0,
+            ..uav_out
+        };
+        assert_eq!(
+            refusal(compile_cs_for_host(
+                &single_read(0x02, 0, 10),
+                vec![root(RootType::Table, 0, 0)],
+                vec![cbv, uav_out],
+            )),
+            Some("a constant buffer's descriptor read as data")
+        );
+
+        // 2. `s_buffer_load` with `used == None` or `Cbv` is lowered as a CBV
+        //    and must refuse reading dword 2 as data.
+        let mut sbuf_words = vec![0xBE84_0300, 0xBE85_0380];
+        sbuf_words.extend(s_load(0x02, 8, 4, 0));
+        sbuf_words.extend(s_load(0x02, 20, 4, 0x40));
+        sbuf_words.extend([0xF420_0404, 0xFA00_0000]); // s_buffer_load_dword s16, s[8:11], null
+        sbuf_words.push(0x8011_0A10); // s_add_u32 s17, s16, s10
+        sbuf_words.push(v_mov_sgpr(1, 17));
+        sbuf_words.extend(buf_store_dword(1, 20, 0));
+        sbuf_words.push(S_ENDPGM);
+        for used_list in [vec![uav_out], vec![cbv, uav_out]] {
+            assert_eq!(
+                refusal(compile_cs_for_host(
+                    &sbuf_words,
+                    vec![root(RootType::Table, 0, 0)],
+                    used_list,
+                )),
+                Some("a constant buffer's descriptor read as data")
+            );
+        }
+
+        // 3. Table slot with no covering `UsedResource` (e.g. 8-dword load of two CBVs)
+        //    must not be guessed as a 2D image.
+        assert_eq!(
+            refusal(compile_cs_for_host(
+                &single_read(0x03, 0, 10),
+                vec![root(RootType::Table, 0, 0)],
+                vec![uav_out],
+            )),
+            Some("a descriptor read only as data")
+        );
+
+        // 4. Non-dword-multiple structured stride (`stride = 2`) must not silently
+        //    degrade to a raw byte-count query.
+        let unaligned_stride = UsedResource {
+            kind: ResourceType::Srv,
+            dwords: 4,
+            stride: 2,
+            table_offset_dwords: 0,
+            ..uav_out
+        };
+        assert_eq!(
+            refusal(compile_cs_for_host(
+                &single_read(0x02, 0, 10),
+                vec![root(RootType::Table, 0, 0)],
+                vec![unaligned_stride, uav_out],
+            )),
+            Some("a descriptor read only as data")
+        );
+
+        // 5. An 8-dword load falling into a 4-dword buffer range is refused.
+        let raw_srv = UsedResource {
+            kind: ResourceType::Srv,
+            dwords: 4,
+            stride: 0,
+            table_offset_dwords: 0,
+            ..uav_out
+        };
+        assert_eq!(
+            refusal(compile_cs_for_host(
+                &single_read(0x03, 0x20, 10),
+                vec![root(RootType::Table, 0, 0)],
+                vec![raw_srv, uav_out],
+            )),
+            Some("a descriptor read only as data")
+        );
+
+        // 6. Address dword 0 of an inferred descriptor still refuses.
+        assert_eq!(
+            refusal(compile_cs_for_host(
+                &single_read(0x02, 0, 8),
+                vec![root(RootType::Table, 0, 0)],
+                vec![raw_srv, uav_out],
+            )),
+            Some("a descriptor's address or format read as data")
+        );
+
+        // 7. Twin load where the sampled load is `s_load_dwordx16` at 0x0 using
+        //    `first = 8` (entry at 0x20, a 3D texture `dim = 2`):
+        //    - A size-only `s_load_dwordx8` at 0x20 resolves to 3D (`dword 4` = depth - 1)
+        //      with `site`'s own `first = 0`.
+        //    - A size-only `s_load_dwordx8` at 0x0 (CBV at 0x0) must NOT match entry 0x20.
+        let mut twin_3d = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+        ];
+        twin_3d.extend(s_load(0x04, 24, 4, 0x00)); // s[24:39]: two 8-dword slots (0x00 and 0x20)
+        twin_3d.extend(s_load(0x03, 8, 4, 0x20)); // s[8:15]:  twin load of entry 0x20 for size
+        twin_3d.extend(s_load(0x02, 16, 6, 0x00)); // s[16:19]: sampler
+        twin_3d.extend(s_load(0x02, 20, 4, 0x40)); // s[20:23]: output UAV
+        twin_3d.extend([0x7E02_0280, 0x7E04_0280, 0x7E06_0280]); // v1..v3 = 0
+        // image_sample_lz v4, v[1:3], s[32:39], s[16:19] dmask:0x1 dim:3D (dim=2)
+        twin_3d.extend([
+            0x3C << 26 | (0x27 << 18) | (0x1 << 8) | (2 << 3),
+            (4 << 21) | (8 << 16) | (4 << 8) | 1,
+        ]);
+        twin_3d.push(v_mov_sgpr(5, 12)); // s12 = dword 4 (depth - 1) of twin load s[8:15]
+        twin_3d.extend([0x060A_0A04]); // v_add_f32 v5, v4, v5
+        twin_3d.extend(buf_store_dword(5, 20, 0));
+        twin_3d.push(S_ENDPGM);
+
+        let srv_3d = UsedResource {
+            kind: ResourceType::Srv,
+            dwords: 8,
+            stride: 0,
+            table_offset_dwords: 8,
+            ..uav_out
+        };
+        let samp = UsedResource {
+            kind: ResourceType::Sampler,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        };
+        assert_eq!(
+            refusal(compile_cs_for_host(
+                &twin_3d,
+                vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
+                vec![cbv, srv_3d, uav_out, samp],
+            )),
+            None
+        );
+
+        // Changing the size-only load from 0x20 to 0x00 hits the CBV at 0x00,
+        // proving `s_load_dwordx16` (`first = 8`) did not falsely match 0x00.
+        let mut wrong_slot = twin_3d;
+        wrong_slot[6..8].copy_from_slice(&s_load(0x03, 8, 4, 0x00));
+        assert_eq!(
+            refusal(compile_cs_for_host(
+                &wrong_slot,
+                vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
+                vec![cbv, srv_3d, uav_out, samp],
+            )),
+            Some("a constant buffer's descriptor read as data")
+        );
     }
 }
