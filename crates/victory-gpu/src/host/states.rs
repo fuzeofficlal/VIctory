@@ -19,7 +19,7 @@ impl HostTexture {
         }
     }
 
-    fn subresource_count(&self) -> u32 {
+    pub(crate) fn subresource_count(&self) -> u32 {
         *self.count.get_or_init(|| {
             // SAFETY: a plain query on the live host resource.
             let desc = unsafe { self.texture.GetDesc() };

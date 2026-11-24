@@ -1332,7 +1332,7 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
             D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATES as State,
-            D3D12_RESOURCE_UAV_BARRIER,
+            D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_UAV_BARRIER,
         };
         use windows::core::Interface;
         const TEXTURE: u32 = 1;
@@ -1365,24 +1365,55 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
                     let wanted = enhanced_layout_state(b.layout_after);
                     let mut emitted_transition = false;
                     if let Some(wanted) = wanted
-                        && let Some((texture, before)) = list.transition(b.resource, wanted)
+                        && let Some(copy) = crate::resource::host_copy(b.resource)
                     {
-                        let after = crate::host::legal_state(texture, wanted);
-                        if before != after {
-                            let tex_key = texture.as_raw() as usize;
-                            if seen_transitions.contains(&tex_key) {
-                                // SAFETY: an open list and live resources.
-                                unsafe { list.list.ResourceBarrier(&out) };
-                                out.clear();
-                                seen_transitions.clear();
+                        let tex_key = copy.texture.as_raw() as usize;
+                        let mut transition = |index| {
+                            list.transition(copy.clone(), index, wanted, |texture, sub, before, after| {
+                                if !emitted_transition {
+                                    if seen_transitions.contains(&tex_key) {
+                                        // SAFETY: an open list and live resources.
+                                        unsafe { list.list.ResourceBarrier(&out) };
+                                        out.clear();
+                                        seen_transitions.clear();
+                                    }
+                                    seen_transitions.push(tex_key);
+                                    emitted_transition = true;
+                                }
+                                out.push(crate::host::transition_subresource(
+                                    texture,
+                                    sub,
+                                    State(before as i32),
+                                    State(after as i32),
+                                ));
+                            });
+                        };
+                        let [first, mip_count, first_slice, slice_count, first_plane, plane_count] =
+                            b.subresources;
+                        if mip_count == 0 {
+                            // A flat subresource index, including the all-subresources sentinel.
+                            transition(first);
+                        } else {
+                            // SAFETY: a live host texture.
+                            let desc = unsafe { copy.texture.GetDesc() };
+                            let mips = u32::from(desc.MipLevels);
+                            let slices = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                                1
+                            } else {
+                                u32::from(desc.DepthOrArraySize)
+                            };
+                            let planes = copy.subresource_count() / (mips * slices);
+                            let mip_end = first.saturating_add(mip_count).min(mips);
+                            let slice_end = first_slice.saturating_add(slice_count).min(slices);
+                            let plane_end = first_plane.saturating_add(plane_count).min(planes);
+                            for plane in first_plane..plane_end {
+                                for slice in first_slice..slice_end {
+                                    let base = (plane * slices + slice) * mips;
+                                    for mip in first..mip_end {
+                                        transition(base + mip);
+                                    }
+                                }
                             }
-                            seen_transitions.push(tex_key);
-                            out.push(crate::host::transition(
-                                texture,
-                                State(before as i32),
-                                State(after as i32),
-                            ));
-                            emitted_transition = true;
                         }
                     }
                     if ((b.access_before | b.access_after) & ACCESS_UAV != 0)
@@ -1869,7 +1900,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn enhanced_texture_barrier_transitions_and_propagates_across_lists() {
-        use std::sync::{Arc, Mutex, atomic::Ordering};
+        use std::sync::{Arc, Mutex};
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -2105,7 +2136,7 @@ mod tests {
             };
 
             // 1. Basic transition: RENDER_TARGET -> COPY_SOURCE without ensure_state.
-            clear_rtv(list1, rtv, &[0.25, 0.5, 0.75, 1.0], 0, null.cast());
+            clear_rtv(list1, rtv, &[0.0, 1.0, 0.0, 1.0], 0, null.cast());
             let b1 = tex_barrier(
                 D3D12_BARRIER_SYNC_RENDER_TARGET,
                 D3D12_BARRIER_SYNC_COPY,
@@ -2125,7 +2156,7 @@ mod tests {
             execute(queue, 1, &list1);
             assert!(host.log_messages().is_none());
             assert!(errors.0.lock().unwrap().is_empty());
-            assert_eq!(read_pixel(), [64, 128, 191, 255]);
+            assert_eq!(read_pixel(), [0, 255, 0, 255]);
 
             // 2. Split-begin skipped, split-end transitions.
             assert_eq!(reset(list1, allocator1, null), S_OK);
@@ -2149,7 +2180,7 @@ mod tests {
             unsafe {
                 host_list(list1).unwrap().list.ClearRenderTargetView(
                     host.rtv(host_tex, None),
-                    &[1.0, 0.5, 0.25, 1.0],
+                    &[1.0, 0.0, 1.0, 1.0],
                     None,
                 );
             }
@@ -2172,11 +2203,11 @@ mod tests {
             execute(queue, 1, &list1);
             assert!(host.log_messages().is_none());
             assert!(errors.0.lock().unwrap().is_empty());
-            assert_eq!(read_pixel(), [255, 128, 64, 255]);
+            assert_eq!(read_pixel(), [255, 0, 255, 255]);
 
             // 3. Duplicate-texture transitions in one Barrier() call + UAV ordering.
             assert_eq!(reset(list1, allocator1, null), S_OK);
-            clear_rtv(list1, rtv, &[0.0, 1.0, 0.5, 1.0], 0, null.cast());
+            clear_rtv(list1, rtv, &[0.0, 1.0, 1.0, 1.0], 0, null.cast());
             let dup = [
                 tex_barrier(
                     D3D12_BARRIER_SYNC_RENDER_TARGET,
@@ -2206,7 +2237,7 @@ mod tests {
             execute(queue, 1, &list1);
             assert!(host.log_messages().is_none());
             assert!(errors.0.lock().unwrap().is_empty());
-            assert_eq!(read_pixel(), [0, 255, 128, 255]);
+            assert_eq!(read_pixel(), [0, 255, 255, 255]);
 
             // 4. Cross-list propagation via HostList::prelude.
             assert_eq!(reset(list1, allocator1, null), S_OK);
@@ -2217,7 +2248,7 @@ mod tests {
             );
             let list2 = new_newer_list(allocator2);
 
-            clear_rtv(list1, rtv, &[0.75, 0.25, 0.5, 1.0], 0, null.cast());
+            clear_rtv(list1, rtv, &[1.0, 0.0, 0.0, 1.0], 0, null.cast());
             let b_to_srv = tex_barrier(
                 D3D12_BARRIER_SYNC_RENDER_TARGET,
                 D3D12_BARRIER_SYNC_ALL_SHADING,
@@ -2237,8 +2268,7 @@ mod tests {
             assert_eq!(
                 crate::resource::host_copy(tex)
                     .unwrap()
-                    .state
-                    .load(Ordering::Relaxed),
+                    .state(0),
                 0x40 | 0x80
             );
 
@@ -2263,12 +2293,11 @@ mod tests {
             assert_eq!(
                 crate::resource::host_copy(tex)
                     .unwrap()
-                    .state
-                    .load(Ordering::Relaxed),
+                    .state(0),
                 0x800
             );
             assert!(errors.0.lock().unwrap().is_empty());
-            assert_eq!(read_pixel(), [191, 64, 128, 255]);
+            assert_eq!(read_pixel(), [255, 0, 0, 255]);
 
             let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
             assert_eq!(release(list2), 0);
