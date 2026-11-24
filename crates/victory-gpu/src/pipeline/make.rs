@@ -28,7 +28,7 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Option<Arc<HostPipeline>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -59,9 +59,17 @@ impl Pending {
         }
     }
 
+    pub(crate) fn with_formats(&self, graphics: &GraphicsState, formats: [i32; 8]) -> Pending {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let mut state = graphics.clone();
+        state.targets.RTFormats = formats.map(DXGI_FORMAT);
+        Self::new(self.shaders.clone(), Some(Box::new(state)))
+    }
+
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            HostPipeline::new(&self.shaders, self.graphics.as_deref()).map(Arc::new)
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -107,7 +115,7 @@ pub(crate) fn waiting() -> u64 {
 
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+pub(crate) fn ready(p: &Arc<Pending>) -> Option<&Arc<HostPipeline>> {
     if p.made.get().is_none() {
         start(p);
         wait(p, crate::frame::current());

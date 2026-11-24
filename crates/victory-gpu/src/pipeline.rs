@@ -163,6 +163,8 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    variants: Mutex<HashMap<[i32; 8], Arc<make::Pending>>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -194,11 +196,34 @@ pub(crate) fn bound(this: This) {
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).
 #[cfg(windows)]
-pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+pub(crate) fn host_pipeline(
+    this: This,
+    widened: Option<&[u32; 8]>,
+) -> Option<Arc<host::HostPipeline>> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let pipeline = pipeline(this);
+    let variant = pipeline.variant(widened);
+    make::ready(variant.as_ref().unwrap_or(&pipeline.host)).cloned()
+}
+
+#[cfg(windows)]
+impl Pipeline {
+    fn variant(&self, widened: Option<&[u32; 8]>) -> Option<Arc<make::Pending>> {
+        let graphics = self.host.graphics.as_deref()?;
+        let formats = graphics.formats_for_targets(widened?)?;
+        let mut variants = self
+            .variants
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Some(
+            variants
+                .entry(formats)
+                .or_insert_with(|| Arc::new(self.host.with_formats(graphics, formats)))
+                .clone(),
+        )
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -257,14 +282,17 @@ pub(crate) fn is_skipped(this: This) -> bool {
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
+pub(crate) fn note_drop(this: This, widened: Option<&[u32; 8]>) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+            .or_else(|| {
+                let variant = p.variant(widened);
+                make::missing(variant.as_ref().unwrap_or(&p.host))
+            })
     };
     if let Some(why) = why {
         note_why(why);
@@ -308,7 +336,13 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        let mut graphics = graphics;
+        if let Some(state) = graphics.as_deref_mut() {
+            state.choose_default_formats();
+        }
+        Arc::new(make::Pending::new(shaders.clone(), graphics))
+    };
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -316,6 +350,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        variants: Mutex::new(HashMap::new()),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

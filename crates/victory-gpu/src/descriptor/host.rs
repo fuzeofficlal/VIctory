@@ -649,6 +649,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(desc) = &mut desc {
+                    desc.Format.0 =
+                        crate::resource::bound_view_format(resource, desc.Format.0 as u32) as i32;
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -680,6 +684,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
+            if let Some(desc) = &mut desc {
+                desc.Format.0 =
+                    crate::resource::bound_view_format(resource, desc.Format.0 as u32) as i32;
+            }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }

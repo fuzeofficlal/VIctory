@@ -63,6 +63,7 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    widened_targets: [u32; 8],
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
@@ -117,8 +118,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+fn dropped(state: &State) {
+    crate::pipeline::note_drop(state.pipeline as This, Some(&state.widened_targets));
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -260,6 +261,7 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.widened_targets = [0; 8];
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -275,7 +277,15 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            let desc = record.desc();
+            if let Some(format) = self.widened_targets.get_mut(rtvs.len())
+                && desc.as_ref().is_none_or(|desc| {
+                    desc.Format.0 == 0 || desc.Format.0 as u32 == crate::resource::RGBA8_UNORM
+                })
+            {
+                *format = crate::resource::widened_packed_format(record.resource).unwrap_or(0);
+            }
+            rtvs.push(host.rtv(texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -294,6 +304,13 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+    }
+
+    fn pipeline_for(&self, compute: bool) -> Option<std::sync::Arc<HostPipeline>> {
+        crate::pipeline::host_pipeline(
+            self.pipeline as This,
+            (!compute).then_some(&self.widened_targets),
+        )
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -345,14 +362,14 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.pipeline_for(false) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        if !self.bind(list, p, false) {
+        if !self.bind(list, &p, false) {
             return false;
         }
         let l = &list.list;
@@ -521,24 +538,24 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, None);
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.pipeline_for(true) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, None);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, &p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -556,7 +573,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.pipeline_for(compute) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -606,7 +623,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self);
         }
     }
 
@@ -811,7 +828,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.pipeline_for(compute) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -865,14 +882,14 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self);
         }
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.pipeline_for(false) else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -952,7 +969,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self);
         }
     }
 }
@@ -974,7 +991,10 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(
+                self.pipeline as This,
+                (kind != 2).then_some(&self.widened_targets),
+            );
             return false;
         }
         const DRAW: u32 = 0;
@@ -1021,8 +1041,8 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+            DISPATCH => match self.pipeline_for(true) {
+                Some(p) if p.compute => self.bind(list, &p, true),
                 _ => false,
             },
             _ => false,
@@ -1030,9 +1050,15 @@ impl State {
         if !ran {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            match self.pipeline_for(kind == DISPATCH) {
+                None => crate::pipeline::note_drop(
+                    self.pipeline as This,
+                    (kind != DISPATCH).then_some(&self.widened_targets),
+                ),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
