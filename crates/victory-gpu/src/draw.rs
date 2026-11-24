@@ -51,6 +51,12 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum UavClear {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -408,14 +414,8 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    /// Binds the title's shader-visible heaps when they change.
+    fn bind_heaps(&mut self, list: &HostList) {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -433,6 +433,124 @@ impl State {
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
+    }
+
+    /// Records a clear of a resource-backed texture or buffer UAV.
+    pub(crate) fn clear_uav(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        cpu: u64,
+        resource: This,
+        value: UavClear,
+        rects: &[RECT],
+    ) {
+        let heap_id = self.heaps[0];
+        if heap_id == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(heap_id as This);
+        if heap.index(gpu).is_none() {
+            return;
+        }
+        let (
+            Some(View::Unordered(cpu_res, counter, words)),
+            Some(View::Unordered(gpu_res, gpu_counter, gpu_words)),
+        ) = (crate::descriptor::view(cpu), crate::descriptor::view(gpu))
+        else {
+            return;
+        };
+        if cpu_res != resource as usize
+            || gpu_res != cpu_res
+            || gpu_counter != counter
+            || gpu_words != words
+        {
+            return;
+        }
+        let Some(native_heap) = heap.host() else {
+            return;
+        };
+        let host_texture = crate::resource::host_resource(resource);
+        let buffer = if host_texture.is_none() && counter == 0 {
+            words.as_ref().and_then(|w| {
+                crate::descriptor::host::buffer_clear_view(
+                    resource,
+                    w,
+                    matches!(value, UavClear::Uint(_)),
+                )
+            })
+        } else {
+            None
+        };
+        let (native_resource, pair) = if let Some(view) = &buffer {
+            let buf = &view.shadow.buffer;
+            (buf, native_heap.clear_uav_pair(list, buf, Some(&view.desc)))
+        } else if let Some(texture) = host_texture {
+            (
+                texture,
+                native_heap.clear_texture_uav(list, texture, words.as_ref()),
+            )
+        } else {
+            return;
+        };
+        let Some((slot, gpu_handle, cpu_handle)) = pair else {
+            return;
+        };
+        self.dynamic.push((heap_id, slot, 1));
+        self.bind_heaps(list);
+        if let Some(view) = &buffer {
+            view.shadow.refresh(list, view.address, view.len);
+            view.shadow.gpu_writes(list, view.address, view.len);
+            buffer_uav_barrier(list, native_resource);
+        } else {
+            crate::list::ensure_state(
+                list,
+                resource,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
+            );
+            crate::texture::host_written(resource);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target(resource);
+        }
+        // SAFETY: matched CPU/GPU UAV descriptors, bound shader-visible heap,
+        // and a live resource in UNORDERED_ACCESS state.
+        unsafe {
+            match value {
+                UavClear::Uint(values) => {
+                    list.list.ClearUnorderedAccessViewUint(
+                        gpu_handle,
+                        cpu_handle,
+                        native_resource,
+                        &values,
+                        rects,
+                    );
+                }
+                UavClear::Float(values) => {
+                    list.list.ClearUnorderedAccessViewFloat(
+                        gpu_handle,
+                        cpu_handle,
+                        native_resource,
+                        &values,
+                        rects,
+                    );
+                }
+            }
+        }
+        if buffer.is_some() {
+            buffer_uav_barrier(list, native_resource);
+        }
+    }
+
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    /// False if the draw or dispatch must not run: a table it reads could
+    /// not be made.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let l = &list.list;
+        self.bind_heaps(list);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -1214,4 +1332,19 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+fn buffer_uav_barrier(list: &HostList, buffer: &ID3D12Resource) {
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: borrowed for the call; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+            }),
+        },
+    };
+    // SAFETY: an open command list and a live host buffer.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
 }

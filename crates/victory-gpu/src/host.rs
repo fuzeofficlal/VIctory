@@ -301,6 +301,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    clear_uav_cpu: OnceLock<Option<ID3D12DescriptorHeap>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -481,6 +482,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                clear_uav_cpu: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1105,6 +1107,27 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// The CPU-only UAV slot used when recording a clear. D3D12 consumes this
+    /// descriptor during recording, so subsequent clears on the list reuse it.
+    pub(crate) fn clear_uav_cpu(&self) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        let heap = self
+            .clear_uav_cpu
+            .get_or_init(|| {
+                // SAFETY: plain allocation of a non-shader-visible view heap.
+                unsafe {
+                    host()?.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                }
+                .ok()
+            })
+            .as_ref()?;
+        // SAFETY: the list owns this heap until it is dropped.
+        Some(unsafe { heap.GetCPUDescriptorHandleForHeapStart() })
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
