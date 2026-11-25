@@ -301,30 +301,45 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the library (when available and modified) and the early-pipeline
+/// key list (whenever new keys were noted, even without a host library) if
+/// `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    let library = library();
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
+        let dirty = USED_CHANGED.load(Ordering::Relaxed)
+            || library.is_some_and(|l| {
+                let l = l.state.lock().unwrap_or_else(|e| e.into_inner());
+                l.added > 0 || l.prebuilt_changed
+            });
+        if !dirty {
+            return;
+        }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
+    save_to(dir, library);
+}
+
+fn save_to(dir: &std::path::Path, library: Option<&Shared>) {
+    let early_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    let serialized = library.and_then(|library| {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
+        if l.added == 0 && !l.prebuilt_changed {
+            return None;
         }
         // SAFETY: a plain size query on a live library.
         let size = unsafe { l.library.GetSerializedSize() };
         let Some(mut bytes) = zeroed(size) else {
             // Left for a later save: the pipelines stay counted as added.
             tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-            return;
+            return None;
         };
         // SAFETY: a buffer of the size the library asks for.
         let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
@@ -335,38 +350,70 @@ pub(crate) fn save(now: bool) {
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                Some((bytes, prebuilt))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
+                None
             }
         }
-    };
-    let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
-            None => Ok(()),
-        });
-    let (created, distinct) = created();
-    let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
-    match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
+    });
+    if serialized.is_none() && !early_changed {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        if early_changed {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+        tracing::warn!(error = %e, "pipeline cache directory not created");
+        return;
+    }
+    let used = USED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(Used::list)
+        .unwrap_or_default();
+    let early_res = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes());
+    if let Err(ref e) = early_res {
+        if early_changed {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+        if serialized.is_none() {
+            tracing::warn!(error = %e, "early pipeline list not saved");
+            return;
+        }
+    }
+    if let Some((blob, prebuilt)) = serialized {
+        let written = write_atomically(&dir.join(LIBRARY_FILE), &blob)
+            .and(early_res)
+            .and_then(|()| match &prebuilt {
+                Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
+                None => Ok(()),
+            });
+        let (created, distinct) = created();
+        let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
+        match written {
+            Ok(()) => tracing::info!(
+                bytes = blob.len(),
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                created,
+                distinct,
+                shaders_cached,
+                shaders_translated,
+                "host pipeline library saved"
+            ),
+            Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        }
+    } else {
+        tracing::info!(
             early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
-            created,
-            distinct,
-            shaders_cached,
-            shaders_translated,
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+            "early pipeline list saved"
+        );
     }
 }
 
@@ -449,6 +496,16 @@ impl Used {
 
 static USED: Mutex<Option<Used>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn read_early_list(dir: &std::path::Path) -> HashSet<String> {
+    let listed = std::fs::read_to_string(dir.join(EARLY_FILE)).unwrap_or_default();
+    listed
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
 
 fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -838,5 +895,59 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn early_pipeline_keys_persist_and_reload_without_a_host_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("pso-cache");
+        use_pipeline_cache(cache_dir.clone());
+        USED_CHANGED.store(false, Ordering::Relaxed);
+
+        // No dirty flag set: saving without a host library creates nothing.
+        save_to(&cache_dir, None);
+        assert!(!cache_dir.join(EARLY_FILE).exists());
+        assert!(!cache_dir.join(LIBRARY_FILE).exists());
+
+        // Record two distinct keys (plus a duplicate) and persist with `library == None`.
+        note_used("gfx:alpha_key");
+        note_used("cs:beta_key");
+        note_used("gfx:alpha_key");
+        assert!(USED_CHANGED.load(Ordering::Relaxed));
+
+        save_to(&cache_dir, None);
+        assert!(cache_dir.join(EARLY_FILE).exists());
+        assert!(!cache_dir.join(LIBRARY_FILE).exists());
+
+        let on_disk = std::fs::read_to_string(cache_dir.join(EARLY_FILE)).unwrap();
+        let lines: Vec<&str> = on_disk.lines().collect();
+        assert_eq!(lines.iter().filter(|&&l| l == "gfx:alpha_key").count(), 1);
+        assert!(lines.contains(&"cs:beta_key"));
+
+        // Simulate next launch: clear in-memory `USED` and verify `wanted_early` reloads
+        // the saved keys from `EARLY_FILE` when `DIR` points at `cache_dir`.
+        if DIR.get() == Some(&cache_dir) {
+            *USED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            assert!(wanted_early("gfx:alpha_key"));
+            assert!(wanted_early("cs:beta_key"));
+            assert!(!wanted_early("gfx:missing_key"));
+
+            // Also exercise `save(true)` end-to-end when only a new early key is added.
+            note_used("gfx:gamma_key");
+            save(true);
+        } else {
+            let reloaded = read_early_list(&cache_dir);
+            assert!(reloaded.contains("gfx:alpha_key"));
+            assert!(reloaded.contains("cs:beta_key"));
+            assert!(!reloaded.contains("gfx:missing_key"));
+            note_used("gfx:gamma_key");
+            save_to(&cache_dir, None);
+        }
+
+        let reloaded = read_early_list(&cache_dir);
+        assert!(reloaded.contains("cs:beta_key"));
+        assert!(reloaded.contains("gfx:alpha_key"));
+        assert!(reloaded.contains("gfx:gamma_key"));
+        assert!(!reloaded.contains("gfx:missing_key"));
     }
 }
