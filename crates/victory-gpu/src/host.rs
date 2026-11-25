@@ -457,6 +457,45 @@ mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn gpu_timing_records_without_dred() {
+        let Some(host) = host() else {
+            return;
+        };
+        let timed_list = host.new_list().expect("new_list");
+        let (buf_a, _) = host.shared_buffer(4096).expect("shared_buffer a");
+        let (buf_b, _) = host.shared_buffer(4096).expect("shared_buffer b");
+        timed_list.record_note(true, false, || "copy 4 KiB synthetic buffer".into(), None);
+        // SAFETY: open command list and two 4 KiB buffers.
+        unsafe { timed_list.list.CopyResource(&buf_b, &buf_a) };
+        timed_list.record_note(true, false, || "uav barrier".into(), None);
+        // SAFETY: open command list and valid global UAV barrier.
+        unsafe {
+            timed_list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        }
+        let (heap, back) = timed_list.ensure_stamps().expect("timestamp heap");
+        timed_list.resolve_stamps(heap, back);
+        timed_list.close();
+        host.execute(&[&timed_list]);
+        // SAFETY: plain queue frequency query.
+        let freq = unsafe { host.queue.GetTimestampFrequency() }.unwrap_or(1);
+        let slowest = timed_list.slowest_from(back, freq, 6);
+        assert_eq!(slowest.len(), 2);
+        assert!(slowest.iter().all(|(ms, _)| ms.is_finite() && *ms >= 0.0));
+        let names: Vec<&str> = slowest.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(names.contains(&"copy 4 KiB synthetic buffer"));
+        assert!(names.contains(&"uav barrier"));
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -528,7 +567,7 @@ pub(crate) fn dred_on() -> bool {
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -876,9 +915,12 @@ impl Host {
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let per_list = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let per_list = false;
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if per_list {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -887,8 +929,6 @@ impl Host {
         } else {
             vec![&lists[..]]
         };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -912,7 +952,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if per_list && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -922,7 +962,7 @@ impl Host {
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            if per_list && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                 removed_in = Some(i);
             }
             let _ = (i, started);
@@ -1252,6 +1292,11 @@ impl HostList {
         if !timing() {
             return None;
         }
+        self.ensure_stamps()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn ensure_stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
         self.stamps
             .get_or_init(|| {
                 let device = &host()?.device;
@@ -1296,10 +1341,24 @@ impl HostList {
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
-        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let Some((_, back)) = self.stamps() else {
             return Vec::new();
         };
+        self.slowest_from(back, frequency, n)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn slowest_from(
+        &self,
+        back: &ID3D12Resource,
+        frequency: u64,
+        n: usize,
+    ) -> Vec<(f64, String)> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let count = notes.len().min(STAMPS as usize - 1);
+        if count == 0 {
+            return Vec::new();
+        }
         let mut data = std::ptr::null_mut();
         let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
@@ -1347,18 +1406,25 @@ impl HostList {
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
-            }
+            self.resolve_stamps(heap, back);
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn resolve_stamps(&self, heap: &ID3D12QueryHeap, back: &ID3D12Resource) {
+        let count =
+            (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+        // SAFETY: an open list, our heap and read-back buffer.
+        unsafe {
+            self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+            self.list
+                .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
         }
     }
 
@@ -1558,25 +1624,43 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
-            }
-            let what = what();
-            traced(&what);
+        self.record_note(timing(), dred_on(), what, range);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn record_note(
+        &self,
+        timed: bool,
+        dred: bool,
+        what: impl FnOnce() -> String,
+        range: Option<(u64, u64)>,
+    ) {
+        if !timed && !dred {
+            return;
+        }
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if timed
+            && at < STAMPS - 1
+            && let Some((heap, _)) = self.ensure_stamps()
+        {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        }
+        let what = what();
+        traced(&what);
+        if dred {
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
             unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                self.list
+                    .SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
         }
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((what, range));
     }
 
     /// Notes a texture the list renders to or writes, in a listed frame.
